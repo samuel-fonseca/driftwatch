@@ -14,7 +14,7 @@ The pipeline, end to end:
 6. **Detect divergence** — track the best bid and best ask per market across venues, and emit a signal when one venue's bid crosses another venue's ask.
 7. **Stream** — fan signals out to subscribers over Server-Sent Events, without letting a slow subscriber degrade ingest.
 
-Ingest is currently REST-polling based; a WebSocket-based ingest path would be a natural next step and should only improve on the throughput numbers below. The project has zero third-party dependencies — everything is built on the Go standard library.
+Ingest is currently REST-polling based; a WebSocket-based ingest path would be a natural next step and should only improve on the throughput numbers below. Everything is built on the Go standard library.
 
 ## Features
 
@@ -42,14 +42,16 @@ internal/dedupe/           change-detection filter
 internal/divergence/       cross-venue divergence detector
 internal/store/            the Store interface
   ndjson/                  NDJSON append-only writer
+  psql/                    PostgreSQL store
 internal/hub/              SSE fan-out hub
 internal/pipeline/         wires the above into one running pipeline
+internal/backoff/          exponential backoff utilities
 ```
 
 ## Running it
 
 ```
-go run ./cmd/driftwatch
+docker compose up -d
 ```
 
 Listens on `:8080`:

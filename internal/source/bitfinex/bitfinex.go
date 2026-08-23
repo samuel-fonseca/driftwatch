@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"time"
 
+	"github.com/samuel-fonseca/driftwatch/internal/backoff"
 	"github.com/samuel-fonseca/driftwatch/internal/normalize"
 	"github.com/samuel-fonseca/driftwatch/internal/quote"
 )
@@ -141,62 +141,30 @@ func (a *Adapter) fetch(ctx context.Context) ([]byte, error) {
 	return body, nil
 }
 
-func jitter(max time.Duration) time.Duration {
-	if max <= 0 {
-		return 0
-	}
-	return time.Duration(rand.Int63n(int64(max)))
-}
-
-func sleep(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func nextBackoff(current, max time.Duration) time.Duration {
-	if current >= max {
-		return max
-	}
-
-	next := current * 2
-	if next > max {
-		return max
-	}
-
-	return next
-}
-
 func (a *Adapter) Run(ctx context.Context, out chan<- quote.Quote) error {
-	if err := sleep(ctx, jitter(a.pollInterval)); err != nil {
+	if err := backoff.Sleep(ctx, backoff.Jitter(a.pollInterval)); err != nil {
 		return err
 	}
 
-	backoff := a.initialBackoff
+	backoffDuration := a.initialBackoff
 	for {
 		body, err := a.fetch(ctx)
 		if err != nil {
 			log.Printf("fetching quotes: %v", err)
-			if err := sleep(ctx, jitter(backoff)); err != nil {
+			if err := backoff.Sleep(ctx, backoff.Jitter(backoffDuration)); err != nil {
 				return err
 			}
-			backoff = nextBackoff(backoff, a.maxBackoff)
+			backoffDuration = backoff.Next(backoffDuration, a.maxBackoff)
 			continue
 		}
 
 		quotes, err := decode(body, time.Now())
 		if err != nil {
 			log.Printf("decoding quotes: %v", err)
-			if err := sleep(ctx, jitter(backoff)); err != nil {
+			if err := backoff.Sleep(ctx, backoff.Jitter(backoffDuration)); err != nil {
 				return err
 			}
-			backoff = nextBackoff(backoff, a.maxBackoff)
+			backoffDuration = backoff.Next(backoffDuration, a.maxBackoff)
 			continue
 		}
 
@@ -208,9 +176,9 @@ func (a *Adapter) Run(ctx context.Context, out chan<- quote.Quote) error {
 			}
 		}
 
-		if err := sleep(ctx, jitter(a.pollInterval)); err != nil {
+		if err := backoff.Sleep(ctx, backoff.Jitter(a.pollInterval)); err != nil {
 			return err
 		}
-		backoff = a.initialBackoff
+		backoffDuration = a.initialBackoff
 	}
 }

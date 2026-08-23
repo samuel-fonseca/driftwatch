@@ -11,19 +11,27 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/samuel-fonseca/driftwatch/internal/hub"
 	"github.com/samuel-fonseca/driftwatch/internal/pipeline"
 	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/source/binance"
 	"github.com/samuel-fonseca/driftwatch/internal/source/bitfinex"
-	"github.com/samuel-fonseca/driftwatch/internal/store/ndjson"
+	"github.com/samuel-fonseca/driftwatch/internal/store/psql"
 )
 
+func loadEnvironmentVariables() {
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("load failed: %v", err)
+	}
+}
+
 func main() {
+	loadEnvironmentVariables()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := ndjson.Open("data/driftwatch.ndjson")
+	st, err := psql.Open(os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("open failed: %v", err)
 	}
