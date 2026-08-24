@@ -40,10 +40,8 @@ func New() *Hub {
 }
 
 type Stats struct {
-	Subscribers int
-	Published   int64
-	Dropped     int64
-	Evicted     int64
+	Subscribers                 int
+	Published, Dropped, Evicted int64
 }
 
 func (h *Hub) Stats() Stats {

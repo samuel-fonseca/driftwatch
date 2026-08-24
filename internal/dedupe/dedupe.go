@@ -13,10 +13,11 @@ type seenEntry struct {
 }
 
 type Detector struct {
-	mu       sync.Mutex
-	capacity int
-	order    *list.List
-	index    map[string]*list.Element
+	mu                     sync.Mutex
+	capacity               int
+	order                  *list.List
+	index                  map[string]*list.Element
+	seen, changed, evicted int64
 }
 
 func New(capacity int) *Detector {
@@ -27,9 +28,25 @@ func New(capacity int) *Detector {
 	}
 }
 
+type Stats struct{ Seen, Changed, Evicted, Size, Capacity int64 }
+
+func (d *Detector) Stats() Stats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return Stats{
+		Seen:     d.seen,
+		Changed:  d.changed,
+		Evicted:  d.evicted,
+		Size:     int64(d.order.Len()),
+		Capacity: int64(d.capacity),
+	}
+}
+
 func (d *Detector) Changed(q quote.Quote) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.seen++
 
 	if entry, ok := d.index[q.Key()]; ok {
 		seen := entry.Value.(*seenEntry)
@@ -39,6 +56,7 @@ func (d *Detector) Changed(q quote.Quote) bool {
 		}
 
 		seen.fingerprint = q.Fingerprint()
+		d.changed++
 		return true
 	}
 
@@ -47,11 +65,13 @@ func (d *Detector) Changed(q quote.Quote) bool {
 		staleEntry := stale.Value.(*seenEntry)
 		delete(d.index, staleEntry.key)
 		d.order.Remove(stale)
+		d.evicted++
 	}
 
 	newEntry := &seenEntry{key: q.Key(), fingerprint: q.Fingerprint()}
 	d.order.PushFront(newEntry)
 	d.index[q.Key()] = d.order.Front()
+	d.changed++
 	return true
 }
 

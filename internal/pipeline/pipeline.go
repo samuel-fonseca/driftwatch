@@ -11,6 +11,7 @@ import (
 	"github.com/samuel-fonseca/driftwatch/internal/dedupe"
 	"github.com/samuel-fonseca/driftwatch/internal/divergence"
 	"github.com/samuel-fonseca/driftwatch/internal/hub"
+	"github.com/samuel-fonseca/driftwatch/internal/metrics"
 	"github.com/samuel-fonseca/driftwatch/internal/quote"
 	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/store"
@@ -37,35 +38,47 @@ type Pipeline struct {
 	div   *divergence.Detector
 }
 
-func New(cfg Config) *Pipeline {
-	if cfg.BufferCapacity == 0 {
-		cfg.BufferCapacity = 16384
+func (c *Config) ApplyDefaults() {
+	if c.BufferCapacity == 0 {
+		c.BufferCapacity = 16384
 	}
-	if cfg.DedupeCapacity == 0 {
-		cfg.DedupeCapacity = 16384
+	if c.DedupeCapacity == 0 {
+		c.DedupeCapacity = 16384
 	}
-	if cfg.EdgeThresholdBps == 0 {
-		cfg.EdgeThresholdBps = 5
+	if c.EdgeThresholdBps == 0 {
+		c.EdgeThresholdBps = 5
 	}
-	if cfg.StaleThreshold == 0 {
-		cfg.StaleThreshold = 2 * time.Second
+	if c.StaleThreshold == 0 {
+		c.StaleThreshold = 2 * time.Second
 	}
-	if cfg.NumWorkers == 0 {
-		cfg.NumWorkers = 4
+	if c.NumWorkers == 0 {
+		c.NumWorkers = 4
 	}
-	if cfg.BatchSize == 0 {
-		cfg.BatchSize = 256
+	if c.BatchSize == 0 {
+		c.BatchSize = 256
 	}
-	if cfg.RawChannelSize == 0 {
-		cfg.RawChannelSize = 4096
+	if c.RawChannelSize == 0 {
+		c.RawChannelSize = 4096
 	}
+}
 
-	return &Pipeline{
+func New(cfg Config) *Pipeline {
+	cfg.ApplyDefaults()
+
+	p := &Pipeline{
 		cfg:   cfg,
 		buf:   buffer.New(cfg.BufferCapacity),
 		dedup: dedupe.New(cfg.DedupeCapacity),
 		div:   divergence.New(cfg.EdgeThresholdBps, cfg.StaleThreshold),
 	}
+	metrics.Registry.MustRegister(metrics.PipelineCollector{
+		Buffer:     p.buf,
+		Hub:        cfg.Hub,
+		Dedupe:     p.dedup,
+		Divergence: p.div,
+	})
+
+	return p
 }
 
 type Stats struct {
