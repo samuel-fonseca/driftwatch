@@ -92,3 +92,21 @@ func TestLRUEvictsLeastRecentlySeen(t *testing.T) {
 		t.Errorf("expected b to have been evicted and re-reported as changed, but it was still tracked")
 	}
 }
+
+func TestSeenGrowsSeparateFromChanged(t *testing.T) {
+	d := New(2)
+	q := quote.Quote{Venue: "binance", Market: "BTC-USD", Selection: "bid", Price: 100, Size: 1}
+	d.Changed(q)
+	d.Changed(q)
+	q.Price = 101
+	d.Changed(q)
+
+	if d.seen != 3 {
+		t.Errorf("seen = %d, want 3", d.seen)
+	}
+	// Both the first sighting and the price change return true and get
+	// written, so both count as changed. Only the identical repeat doesn't.
+	if d.changed != 2 {
+		t.Errorf("changed = %d, want 2", d.changed)
+	}
+}

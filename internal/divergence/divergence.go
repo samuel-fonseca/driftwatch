@@ -24,6 +24,14 @@ type Detector struct {
 	latest           map[string]map[string]map[string]quote.Quote
 	edgeThresholdBps float64
 	staleThreshold   time.Duration
+	observed,
+	emitted,
+	suppressedInvalidSelection,
+	suppressedIncompleteBook,
+	suppressedNotCrossed,
+	SuppressedSameVenue,
+	suppressedBelowThreshold,
+	suppressedStale int64
 }
 
 func New(edgeThresholdBps float64, staleThreshold time.Duration) *Detector {
@@ -34,12 +42,42 @@ func New(edgeThresholdBps float64, staleThreshold time.Duration) *Detector {
 	}
 }
 
+type Stats struct {
+	Observed,
+	Emitted,
+	SuppressedInvalidSelection,
+	SuppressedIncompleteBook,
+	SuppressedNotCrossed,
+	SuppressedSameVenue,
+	SuppressedBelowThreshold,
+	SuppressedStale int64
+}
+
+func (d *Detector) Stats() Stats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return Stats{
+		Observed:                   d.observed,
+		Emitted:                    d.emitted,
+		SuppressedInvalidSelection: d.suppressedInvalidSelection,
+		SuppressedIncompleteBook:   d.suppressedIncompleteBook,
+		SuppressedNotCrossed:       d.suppressedNotCrossed,
+		SuppressedSameVenue:        d.SuppressedSameVenue,
+		SuppressedBelowThreshold:   d.suppressedBelowThreshold,
+		SuppressedStale:            d.suppressedStale,
+	}
+}
+
 func (d *Detector) Observe(q quote.Quote) *Signal {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	d.observed++
+
 	// return early without storing
 	if q.Selection != "bid" && q.Selection != "ask" {
+		d.suppressedInvalidSelection++
 		return nil
 	}
 
@@ -68,7 +106,18 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 		}
 	}
 
-	if !haveBid || !haveAsk || bestBid.Price <= bestAsk.Price || bestAsk.Venue == bestBid.Venue {
+	if !haveBid || !haveAsk {
+		d.suppressedIncompleteBook++
+		return nil
+	}
+
+	if bestBid.Price <= bestAsk.Price {
+		d.suppressedNotCrossed++
+		return nil
+	}
+
+	if bestAsk.Venue == bestBid.Venue {
+		d.SuppressedSameVenue++
 		return nil
 	}
 
@@ -76,6 +125,7 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	edgeBps := (bestBid.Price - bestAsk.Price) / mid * 10_000
 
 	if edgeBps < d.edgeThresholdBps {
+		d.suppressedBelowThreshold++
 		return nil
 	}
 
@@ -84,8 +134,11 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	stalestLeg := time.Duration(math.Max(float64(bestAskTimeSinceObserved), float64(bestBidTimeSinceObserved)))
 
 	if stalestLeg > d.staleThreshold {
+		d.suppressedStale++
 		return nil
 	}
+
+	d.emitted++
 
 	return &Signal{
 		Market:     q.Market,

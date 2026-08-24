@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samuel-fonseca/driftwatch/internal/hub"
+	"github.com/samuel-fonseca/driftwatch/internal/metrics"
 	"github.com/samuel-fonseca/driftwatch/internal/pipeline"
 	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/source/binance"
@@ -49,6 +51,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/stream", h)
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(p.Stats())
