@@ -11,9 +11,24 @@ import (
 	"time"
 
 	"github.com/samuel-fonseca/driftwatch/internal/quote"
+	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
 var fixedTime = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+
+// testTable stands in for what the registry loads from exchangeInfo. A symbol
+// absent from it is one the venue does not list as spot.
+var testTable = symbols.Table{
+	"BTCUSDT": {Symbol: "BTCUSDT", Base: "BTC", Quote: "USDT", Market: "BTC-USDT"},
+	"BTCUSDC": {Symbol: "BTCUSDC", Base: "BTC", Quote: "USDC", Market: "BTC-USDC"},
+	"ETHUSDT": {Symbol: "ETHUSDT", Base: "ETH", Quote: "USDT", Market: "ETH-USDT"},
+	"SOLUSDT": {Symbol: "SOLUSDT", Base: "SOL", Quote: "USDT", Market: "SOL-USDT"},
+}
+
+func testLookup(symbol string) (symbols.Instrument, bool) {
+	inst, ok := testTable[symbol]
+	return inst, ok
+}
 
 // --- decode tests ---
 // Note the format difference from Bitfinex throughout: Binance's numeric
@@ -27,7 +42,7 @@ func TestDecodeSimpleTradingPair(t *testing.T) {
 		{"symbol":"BTCUSDT","bidPrice":"65432.10000000","bidQty":"3.50000000","askPrice":"65433.00000000","askQty":"2.10000000"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -44,7 +59,7 @@ func TestDecodeSimpleTradingPair(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a bid quote")
 	}
-	if bid.Market != "BTC-USD" || bid.Venue != "binance" || bid.Price != 65432.10 || bid.Size != 3.5 {
+	if bid.Market != "BTC-USDT" || bid.Venue != "binance" || bid.Price != 65432.10 || bid.Size != 3.5 {
 		t.Errorf("bid = %+v, unexpected fields", bid)
 	}
 	if !bid.ObservedAt.Equal(fixedTime) || !bid.ReceivedAt.Equal(fixedTime) {
@@ -60,22 +75,52 @@ func TestDecodeSimpleTradingPair(t *testing.T) {
 	}
 }
 
-// TestDecodeLongestMatchFirst: regression coverage for the exact trap
-// the PRD calls out for Binance specifically -- "USDT" must be matched
-// before the shorter "USD"/"UST" suffixes, or "ETHUSDT" gets split
-// wrong. This exercises it through the REAL decode path, not just
-// normalize in isolation.
-func TestDecodeLongestMatchFirst(t *testing.T) {
+// Replaces the old longest-suffix-match test: decode no longer parses symbols,
+// so the property to protect is that it never invents a market of its own.
+func TestDecodeUsesRegistryMarket(t *testing.T) {
 	body := `[
 		{"symbol":"ETHUSDT","bidPrice":"3200.50000000","bidQty":"10.00000000","askPrice":"3201.00000000","askQty":"8.00000000"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(quotes) != 2 || quotes[0].Market != "ETH-USD" {
-		t.Fatalf("expected ETH-USD market from ETHUSDT, got %+v", quotes)
+	if len(quotes) != 2 {
+		t.Fatalf("len(quotes) = %d, want 2", len(quotes))
+	}
+	want := testTable["ETHUSDT"].Market
+	for _, q := range quotes {
+		if q.Market != want {
+			t.Errorf("Market = %q, want %q", q.Market, want)
+		}
+	}
+}
+
+// BTCUSDT and BTCUSDC are separate books at different prices. Under the old
+// stablecoin collapse they shared one Key(), so all but one row per poll was
+// dropped by ON CONFLICT DO NOTHING at insert.
+func TestDecodeKeepsStablecoinBooksDistinct(t *testing.T) {
+	body := `[
+		{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"},
+		{"symbol":"BTCUSDC","bidPrice":"65401.00","bidQty":"1.2","askPrice":"65402.00","askQty":"1.4"}
+	]`
+
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(quotes) != 4 {
+		t.Fatalf("len(quotes) = %d, want 4 (two books, two sides each)", len(quotes))
+	}
+
+	seen := map[string]quote.Quote{}
+	for _, q := range quotes {
+		if prev, dup := seen[q.Key()]; dup {
+			t.Errorf("Key() collision %q: %v @ %v and %v @ %v",
+				q.Key(), prev.Market, prev.Price, q.Market, q.Price)
+		}
+		seen[q.Key()] = q
 	}
 }
 
@@ -86,7 +131,7 @@ func TestDecodeZeroPriceSideDropped(t *testing.T) {
 		{"symbol":"ETHUSDT","bidPrice":"0.00000000","bidQty":"0.00000000","askPrice":"3201.00000000","askQty":"8.00000000"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -108,7 +153,7 @@ func TestDecodeMalformedNumberSkipsRow(t *testing.T) {
 		{"symbol":"BTCUSDT","bidPrice":"not-a-number","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -117,15 +162,14 @@ func TestDecodeMalformedNumberSkipsRow(t *testing.T) {
 	}
 }
 
-// TestDecodeUnnormalizableSymbolDropped: same normalize.Normalize
-// integration as Bitfinex's decode -- a symbol with no known quote
-// asset suffix should be dropped, not guessed at.
+// "Skip, never guess" still holds; a registry miss now means Binance does not
+// list the symbol as active spot.
 func TestDecodeUnnormalizableSymbolDropped(t *testing.T) {
 	body := `[
 		{"symbol":"BTCXYZ","bidPrice":"100.0","bidQty":"1.0","askPrice":"101.0","askQty":"1.0"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +186,7 @@ func TestDecodeMixedBatch(t *testing.T) {
 		{"symbol":"SOLUSDT","bidPrice":"not-a-number","bidQty":"1.0","askPrice":"150.0","askQty":"1.0"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -154,7 +198,7 @@ func TestDecodeMixedBatch(t *testing.T) {
 }
 
 func TestDecodeEmptyArray(t *testing.T) {
-	quotes, err := decode([]byte(`[]`), fixedTime)
+	quotes, err := decode([]byte(`[]`), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -225,8 +269,16 @@ func TestRunRecoversAfterTransientFailures(t *testing.T) {
 	fs := newFlakyServer(3, `[{"symbol":"BTCUSDT","bidPrice":"100.0","bidQty":"1.0","askPrice":"101.0","askQty":"1.0"}]`)
 	defer fs.Close()
 
+	// Run loads the symbol table before polling; without a stub this pulls
+	// several MB from live Binance and fails offline.
+	symbolsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(exchangeInfoBody))
+	}))
+	defer symbolsServer.Close()
+
 	a := New()
 	a.baseURL = fs.URL
+	a.exchangeInfoURL = symbolsServer.URL
 	a.pollInterval = 50 * time.Millisecond
 	a.initialBackoff = 10 * time.Millisecond
 	a.maxBackoff = 100 * time.Millisecond
@@ -242,8 +294,8 @@ func TestRunRecoversAfterTransientFailures(t *testing.T) {
 
 	select {
 	case q := <-out:
-		if q.Market != "BTC-USD" {
-			t.Errorf("got quote for %q, want BTC-USD", q.Market)
+		if q.Market != "BTC-USDT" {
+			t.Errorf("got quote for %q, want BTC-USDT", q.Market)
 		}
 	case err := <-errCh:
 		t.Fatalf("Run returned early with err=%v before delivering any quote", err)
@@ -300,11 +352,13 @@ func TestRunReturnsPromptlyOnCancellation(t *testing.T) {
 	}
 }
 
+// Binance-shaped: objects with numeric fields as JSON strings. Emitting
+// Bitfinex's positional arrays here made the benchmark time an unmarshal error.
 func buildLargeFixture(n int) []byte {
 	rows := make([]string, n)
 	for i := range n {
 		rows[i] = fmt.Sprintf(
-			`["tBTCUSD", %f, 3.5, %f, 2.1, 120.5, 0.0019, 65433.0, 15234.7, 66000.0, 64000.0]`,
+			`{"symbol":"BTCUSDT","bidPrice":"%f","bidQty":"3.5","askPrice":"%f","askQty":"2.1"}`,
 			65000.0+float64(i%500), 65001.0+float64(i%500),
 		)
 	}
@@ -319,6 +373,6 @@ func BenchmarkDecode(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		decode(data, fixedTime)
+		decode(data, fixedTime, testLookup)
 	}
 }

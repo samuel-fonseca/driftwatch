@@ -1,117 +1,97 @@
 package normalize
 
-import (
-	"testing"
-)
+import "testing"
 
-func TestNormalize(t *testing.T) {
+func TestCanonicalAssetRewritesKnownCodes(t *testing.T) {
 	cases := []struct {
-		name       string
-		venue      string
-		symbol     string
-		wantMarket string
-		wantOk     bool
+		name, in, want string
 	}{
-		{
-			name:       "binance simple USDT pair collapses to USD",
-			venue:      "binance",
-			symbol:     "BTCUSDT",
-			wantMarket: "BTC-USD",
-			wantOk:     true,
-		},
-		{
-			name:       "bitfinex simple USD pair, t-prefix stripped",
-			venue:      "bitfinex",
-			symbol:     "tBTCUSD",
-			wantMarket: "BTC-USD",
-			wantOk:     true,
-		},
-		{
-			name:       "bitfinex UST collapses to USD, matching binance USDT",
-			venue:      "bitfinex",
-			symbol:     "tBTCUST",
-			wantMarket: "BTC-USD", // currently FAILS until you add UST to stablecoins
-			wantOk:     true,
-		},
-		{
-			name:       "bitfinex colon-separated pair",
-			venue:      "bitfinex",
-			symbol:     "tDOGE:USD",
-			wantMarket: "DOGE-USD",
-			wantOk:     true,
-		},
-		{
-			name:       "bitfinex colon-separated pair, non-USD quote asset",
-			venue:      "bitfinex",
-			symbol:     "tBTC:XAUT",
-			wantMarket: "BTC-XAUT",
-			wantOk:     true,
-		},
-		{
-			name:   "bitfinex funding row rejected outright",
-			venue:  "bitfinex",
-			symbol: "fUSD",
-			wantOk: false,
-		},
-		{
-			name:   "bitfinex funding row with longer symbol still rejected",
-			venue:  "bitfinex",
-			symbol: "fTESTUSDT",
-			wantOk: false,
-		},
-		{
-			name:   "unsplittable binance symbol dropped, not guessed",
-			venue:  "binance",
-			symbol: "BTCXYZ",
-			wantOk: false,
-		},
-		{
-			name:       "bitfinex perpetual future — documented gap, not a spot market",
-			venue:      "bitfinex",
-			symbol:     "tBTCF0:USTF0",
-			wantMarket: "BTCF0-USTF0",
-			wantOk:     true,
-		},
+		{"kraken bitcoin shorthand", "XBT", "BTC"},
+		{"kraken prefixed bitcoin", "XXBT", "BTC"},
+		{"kraken prefixed dollar", "ZUSD", "USD"},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotMarket, gotOk := Normalize(c.venue, c.symbol)
-			if gotOk != c.wantOk {
-				t.Errorf("ok = %v, want %v", gotOk, c.wantOk)
-			}
-			if gotMarket != c.wantMarket {
-				t.Errorf("market = %v, want %v", gotMarket, c.wantMarket)
+			if got := CanonicalAsset(c.in); got != c.want {
+				t.Errorf("CanonicalAsset(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}
 }
 
-func TextCrossRevenueAgreement(t *testing.T) {
+func TestCanonicalAssetPassesThroughUnknownCodes(t *testing.T) {
+	for _, in := range []string{"BTC", "ETH", "USDT", "USDC", "SOL", "EUR"} {
+		if got := CanonicalAsset(in); got != in {
+			t.Errorf("CanonicalAsset(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
+
+// Kraken lists 22 four-character X*/Z* codes; only some are prefixed forms.
+// These are real asset names, so "strip a leading X or Z" is wrong.
+func TestCanonicalAssetDoesNotStripLeadingXZ(t *testing.T) {
+	for _, in := range []string{"XAUT", "XION", "ZAMA", "ZBCN", "ZETA", "ZEUS", "ZORA"} {
+		if got := CanonicalAsset(in); got != in {
+			t.Errorf("CanonicalAsset(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
+
+func TestMarketFormatsCanonicalPair(t *testing.T) {
 	cases := []struct {
-		name           string
-		binanceSymbol  string
-		bitfinexSymbol string
+		base, quote, want string
 	}{
-		{"USDT vs plain USD", "BTCUSDT", "tBTCUSD"},
-		{"USDT vs UST (bitfinex's own tether ticker)", "BTCUSDT", "tBTCUST"},
+		{"BTC", "USDT", "BTC-USDT"},
+		{"BTC", "USD", "BTC-USD"},
+		{"ETH", "BTC", "ETH-BTC"},
 	}
 
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			binanceMarket, ok := Normalize("binance", c.binanceSymbol)
-			if !ok {
-				t.Fatalf("expected binance %s to normalize", c.binanceSymbol)
-			}
+		if got := Market(c.base, c.quote); got != c.want {
+			t.Errorf("Market(%q, %q) = %q, want %q", c.base, c.quote, got, c.want)
+		}
+	}
+}
 
-			bitfinexMarket, ok := Normalize("bitfinex", c.bitfinexSymbol)
-			if !ok {
-				t.Fatalf("expected bitfinex %s to normalize", c.bitfinexSymbol)
-			}
+// Four Binance books (BTCUSDT/USDC/FDUSD/USD) shared one market id while the
+// stablecoin collapse was in place, so they overwrote each other.
+func TestMarketKeepsQuoteAssetsDistinct(t *testing.T) {
+	seen := map[string]string{}
+	for _, quoteAsset := range []string{"USD", "USDT", "USDC", "FDUSD", "TUSD"} {
+		market := Market("BTC", quoteAsset)
+		if prev, dup := seen[market]; dup {
+			t.Errorf("Market(BTC, %q) = %q, which collides with quote asset %q", quoteAsset, market, prev)
+		}
+		seen[market] = quoteAsset
+	}
+}
 
-			if binanceMarket != bitfinexMarket {
-				t.Errorf("venues disagree: binance=%v, bitfinex=%v", binanceMarket, bitfinexMarket)
-			}
-		})
+func TestQuoteClassGroupsDollarStablecoins(t *testing.T) {
+	for _, in := range []string{"USD", "USDT", "USDC", "FDUSD", "TUSD", "BUSD", "PYUSD", "RLUSD", "DAI"} {
+		if got := QuoteClass(in); got != "USD" {
+			t.Errorf("QuoteClass(%q) = %q, want %q", in, got, "USD")
+		}
+	}
+}
+
+func TestQuoteClassPassesThroughNonDollarQuotes(t *testing.T) {
+	for _, in := range []string{"BTC", "ETH", "EUR", "GBP", "JPY", "XAUT"} {
+		if got := QuoteClass(in); got != in {
+			t.Errorf("QuoteClass(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
+
+// Market keeps the books apart; QuoteClass is the one seam where they meet.
+func TestQuoteClassIsTheOnlyPlaceStablecoinsMeet(t *testing.T) {
+	usdt := Market("BTC", "USDT")
+	usd := Market("BTC", "USD")
+
+	if usdt == usd {
+		t.Fatalf("Market collapsed %q and %q into the same id", "USDT", "USD")
+	}
+	if got, want := QuoteClass("USDT"), QuoteClass("USD"); got != want {
+		t.Errorf("QuoteClass(USDT) = %q, QuoteClass(USD) = %q; want them equal so the class can cross them", got, want)
 	}
 }
