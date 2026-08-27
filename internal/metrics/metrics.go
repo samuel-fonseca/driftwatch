@@ -158,135 +158,48 @@ func (c PipelineCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c PipelineCollector) Collect(ch chan<- prometheus.Metric) {
-	bufStats := c.Buffer.Stats()
-	hubStats := c.Hub.Stats()
-	dedupeStats := c.Dedupe.Stats()
-	divergenceStats := c.Divergence.Stats()
+	buf := c.Buffer.Stats()
+	hub := c.Hub.Stats()
+	dedbupe := c.Dedupe.Stats()
+	divergence := c.Divergence.Stats()
 
 	// Buffer stats
-	ch <- prometheus.MustNewConstMetric(
-		bufferStatPushedDesc,
-		prometheus.CounterValue,
-		float64(bufStats.Pushed),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferStatCoalescedDesc,
-		prometheus.CounterValue,
-		float64(bufStats.Coalesced),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferStatEvictedDesc,
-		prometheus.CounterValue,
-		float64(bufStats.Evicted),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferStatTakenDesc,
-		prometheus.CounterValue,
-		float64(bufStats.Taken),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferStatDepthDesc,
-		prometheus.GaugeValue,
-		float64(bufStats.Depth),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferMaxDepthDesc,
-		prometheus.GaugeValue,
-		float64(bufStats.MaxDepth),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		bufferCapacityDesc,
-		prometheus.GaugeValue,
-		float64(bufStats.Capacity),
-	)
+	counter(ch, bufferStatPushedDesc, uint64(buf.Pushed))
+	counter(ch, bufferStatCoalescedDesc, uint64(buf.Coalesced))
+	counter(ch, bufferStatEvictedDesc, uint64(buf.Evicted))
+	counter(ch, bufferStatTakenDesc, uint64(buf.Taken))
+	gauge(ch, bufferStatDepthDesc, buf.Depth)
+	gauge(ch, bufferMaxDepthDesc, buf.MaxDepth)
+	gauge(ch, bufferCapacityDesc, buf.Capacity)
+
 	// Hub stats
-	ch <- prometheus.MustNewConstMetric(
-		hubSubscriberDesc,
-		prometheus.GaugeValue,
-		float64(hubStats.Subscribers),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		hubPublishedDesc,
-		prometheus.CounterValue,
-		float64(hubStats.Published),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		hubDroppedDesc,
-		prometheus.CounterValue,
-		float64(hubStats.Dropped),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		hubEvictedDesc,
-		prometheus.CounterValue,
-		float64(hubStats.Evicted),
-	)
+	gauge(ch, hubSubscriberDesc, hub.Subscribers)
+	counter(ch, hubPublishedDesc, uint64(hub.Published))
+	counter(ch, hubDroppedDesc, uint64(hub.Dropped))
+	counter(ch, hubEvictedDesc, uint64(hub.Evicted))
 
 	// Dedupe stats
-	ch <- prometheus.MustNewConstMetric(
-		dedupeSeenDesc,
-		prometheus.CounterValue,
-		float64(dedupeStats.Seen),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		dedupeChangedDesc,
-		prometheus.CounterValue,
-		float64(dedupeStats.Changed),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		dedupeEvictedDesc,
-		prometheus.CounterValue,
-		float64(dedupeStats.Evicted),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		dedupeSizeDesc,
-		prometheus.GaugeValue,
-		float64(dedupeStats.Size),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		dedupeCapacityDesc,
-		prometheus.GaugeValue,
-		float64(dedupeStats.Capacity),
-	)
+	counter(ch, dedupeSeenDesc, uint64(dedbupe.Seen))
+	counter(ch, dedupeChangedDesc, uint64(dedbupe.Changed))
+	counter(ch, dedupeEvictedDesc, uint64(dedbupe.Evicted))
+	gauge(ch, dedupeSizeDesc, int(dedbupe.Size))
+	gauge(ch, dedupeCapacityDesc, int(dedbupe.Capacity))
 
 	// Divergence stats
-	ch <- prometheus.MustNewConstMetric(
-		divergenceObservedDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.Observed),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceEmittedDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.Emitted),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceInvalidSelectionDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedInvalidSelection),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceIncompleteBookDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedIncompleteBook),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceNotCrossedDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedNotCrossed),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceSameVenueDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedSameVenue),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceBelowThresholdDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedBelowThreshold),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		divergenceStaleDesc,
-		prometheus.CounterValue,
-		float64(divergenceStats.SuppressedStale),
-	)
+	counter(ch, divergenceObservedDesc, uint64(divergence.Observed))
+	counter(ch, divergenceEmittedDesc, uint64(divergence.Emitted))
+	counter(ch, divergenceInvalidSelectionDesc, uint64(divergence.SuppressedInvalidSelection))
+	counter(ch, divergenceIncompleteBookDesc, uint64(divergence.SuppressedIncompleteBook))
+	counter(ch, divergenceNotCrossedDesc, uint64(divergence.SuppressedNotCrossed))
+	counter(ch, divergenceSameVenueDesc, uint64(divergence.SuppressedSameVenue))
+	counter(ch, divergenceBelowThresholdDesc, uint64(divergence.SuppressedBelowThreshold))
+	counter(ch, divergenceStaleDesc, uint64(divergence.SuppressedStale))
+}
+
+func counter(ch chan<- prometheus.Metric, desc *prometheus.Desc, value uint64) {
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, float64(value))
+}
+
+func gauge(ch chan<- prometheus.Metric, desc *prometheus.Desc, value int) {
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(value))
 }
