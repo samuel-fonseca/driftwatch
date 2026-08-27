@@ -1,71 +1,37 @@
 package normalize
 
-import (
-	"strings"
-)
-
-var quoteAssets = []string{
-	"USDT", "FDUSD", "TUSD", "BUSD", "USDC", "XAUT",
-	"USD", "UST", "BTC", "ETH",
-}
-
 var stablecoins = map[string]string{
+	"USD":   "USD",
 	"USDT":  "USD",
 	"USDC":  "USD",
 	"FDUSD": "USD",
 	"TUSD":  "USD",
 	"BUSD":  "USD",
-	"UST":   "USD",
+	"PYUSD": "USD",
+	"RLUSD": "USD",
+	"DAI":   "USD",
 }
 
-func Normalize(venue, symbol string) (market string, ok bool) {
-	switch venue {
-	case "binance":
-		return normalizeBinance(symbol)
-	case "bitfinex":
-		return normalizeBitfinex(symbol)
-	default:
-		return "", false
-	}
+var canonicalAssetsMap = map[string]string{
+	"XBT":  "BTC",
+	"XXBT": "BTC",
+	"ZUSD": "USD",
 }
 
-func normalizeBinance(symbol string) (market string, ok bool) {
-	for _, asset := range quoteAssets {
-		if base, found := strings.CutSuffix(symbol, asset); found {
-			return base + "-" + collapseStablecoin(asset), true
-		}
+func CanonicalAsset(a string) string {
+	if c, ok := canonicalAssetsMap[a]; ok {
+		return c
 	}
-
-	return "", false
+	return a
 }
 
-func normalizeBitfinex(symbol string) (market string, ok bool) {
-	if strings.HasPrefix(symbol, "f") {
-		return "", false
-	}
-
-	if !strings.HasPrefix(symbol, "t") {
-		return "", false
-	}
-
-	body := strings.TrimPrefix(symbol, "t")
-
-	if base, asset, found := strings.Cut(body, ":"); found {
-		return base + "-" + collapseStablecoin(asset), true
-	}
-
-	for _, asset := range quoteAssets {
-		if base, found := strings.CutSuffix(body, asset); found {
-			return base + "-" + collapseStablecoin(asset), true
-		}
-	}
-
-	return "", false
+func Market(base, quote string) string {
+	return base + "-" + quote
 }
 
-func collapseStablecoin(quote string) string {
-	if coin, found := stablecoins[quote]; found {
-		return coin
+func QuoteClass(quote string) string {
+	if c, ok := stablecoins[quote]; ok {
+		return c
 	}
 	return quote
 }

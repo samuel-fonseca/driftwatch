@@ -11,18 +11,34 @@ import (
 	"time"
 
 	"github.com/samuel-fonseca/driftwatch/internal/quote"
+	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
 // fixedTime gives every test a deterministic ObservedAt/ReceivedAt to
 // assert against, rather than depending on time.Now() at test-run time.
 var fixedTime = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 
+// testTable stands in for what the registry loads from Bitfinex's conf API.
+// What is absent matters too: no funding symbol, no F0 perpetual, no TEST
+// pair -- pub:list:pair:exchange excludes those upstream.
+var testTable = symbols.Table{
+	"tBTCUSD":   {Symbol: "tBTCUSD", Base: "BTC", Quote: "USD", Market: "BTC-USD"},
+	"tBTCUST":   {Symbol: "tBTCUST", Base: "BTC", Quote: "USDT", Market: "BTC-USDT"},
+	"tETHUSD":   {Symbol: "tETHUSD", Base: "ETH", Quote: "USD", Market: "ETH-USD"},
+	"tDOGE:USD": {Symbol: "tDOGE:USD", Base: "DOGE", Quote: "USD", Market: "DOGE-USD"},
+}
+
+func testLookup(symbol string) (symbols.Instrument, bool) {
+	inst, ok := testTable[symbol]
+	return inst, ok
+}
+
 func TestDecodeSimpleTradingPair(t *testing.T) {
 	body := `[
 		["tBTCUSD", 65432.0, 3.5, 65433.0, 2.1, 120.5, 0.0019, 65433.0, 15234.7, 66000.0, 64000.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,7 +76,7 @@ func TestDecodeColonSeparatedPair(t *testing.T) {
 		["tDOGE:USD", 0.24, 5000.0, 0.241, 4800.0, 0.01, 0.04, 0.241, 900000.0, 0.25, 0.23]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -72,26 +88,61 @@ func TestDecodeColonSeparatedPair(t *testing.T) {
 	}
 }
 
-func TestDecodeUSTCollapsesToUSD(t *testing.T) {
+// UST is Bitfinex's ticker for Tether, so tBTCUST is a USDT-quoted book and
+// tBTCUSD a dollar-quoted one. This test used to demand they collapse.
+func TestDecodeUSTIsItsOwnMarket(t *testing.T) {
 	body := `[
 		["tBTCUST", 65400.0, 3.0, 65401.0, 2.0, 100.0, 0.001, 65401.0, 10000.0, 66000.0, 64000.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(quotes) != 2 || quotes[0].Market != "BTC-USD" {
-		t.Fatalf("expected BTC-USD market from tBTCUST, got %+v", quotes)
+	if len(quotes) != 2 {
+		t.Fatalf("len(quotes) = %d, want 2", len(quotes))
+	}
+	if quotes[0].Market != "BTC-USDT" {
+		t.Fatalf("expected BTC-USDT market from tBTCUST, got %+v", quotes)
+	}
+	if quotes[0].Market == testTable["tBTCUSD"].Market {
+		t.Errorf("tBTCUST and tBTCUSD share market %q", quotes[0].Market)
 	}
 }
 
+// tBTCUSD and tBTCUST are the exact pair that used to collide on this venue.
+func TestDecodeKeepsQuoteAssetsDistinct(t *testing.T) {
+	body := `[
+		["tBTCUSD", 65432.0, 3.5, 65433.0, 2.1, 120.5, 0.0019, 65433.0, 15234.7, 66000.0, 64000.0],
+		["tBTCUST", 65400.0, 3.0, 65401.0, 2.0, 100.0, 0.001, 65401.0, 10000.0, 66000.0, 64000.0]
+	]`
+
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(quotes) != 4 {
+		t.Fatalf("len(quotes) = %d, want 4 (two books, two sides each)", len(quotes))
+	}
+
+	seen := map[string]quote.Quote{}
+	for _, q := range quotes {
+		if prev, dup := seen[q.Key()]; dup {
+			t.Errorf("Key() collision %q: %v @ %v and %v @ %v",
+				q.Key(), prev.Market, prev.Price, q.Market, q.Price)
+		}
+		seen[q.Key()] = q
+	}
+}
+
+// Funding rows have a different positional layout, so misreading one yields a
+// plausible wrong price. Table keys are "t"+pair, so an f-symbol can never hit.
 func TestDecodeFundingRowRejected(t *testing.T) {
 	body := `[
 		["fUSD", 0.00015, 0.00014, 2, 850000.0, 0.00016, 30, 620000.0, 0.00001, 0.07, 0.00015, 12000000.0, 0.00020, 0.00010, 45000000.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,7 +156,7 @@ func TestDecodeZeroPriceSideDropped(t *testing.T) {
 		["tETHUSD", 0, 0, 3456.7, 8.2, 12.0, 0.0035, 3456.7, 5000.0, 3500.0, 3400.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -122,11 +173,13 @@ func TestDecodeOutOfScopeSymbolDropped(t *testing.T) {
 		["tGERMANY40IXF0:USTF0", 100.0, 1.0, 101.0, 1.0, 0.0, 0.0, 100.5, 0.0, 105.0, 95.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	t.Logf("out-of-scope symbol produced %d quotes: %+v", len(quotes), quotes)
+	if len(quotes) != 0 {
+		t.Fatalf("expected the F0 perpetual to be dropped, got %+v", quotes)
+	}
 }
 
 func TestDecodeMixedBatch(t *testing.T) {
@@ -136,7 +189,7 @@ func TestDecodeMixedBatch(t *testing.T) {
 		["tETHUSD", 0, 0, 3456.7, 8.2, 12.0, 0.0035, 3456.7, 5000.0, 3500.0, 3400.0]
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime)
+	quotes, err := decode([]byte(body), fixedTime, testLookup)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,8 +256,16 @@ func TestRunRecoversAfterTransientFailures(t *testing.T) {
 	fs := newFlakyServer(3, `[["tBTCUSD", 100.0, 1.0, 101.0, 1.0]]`)
 	defer fs.Close()
 
+	// Run loads the symbol table before polling; without a stub this calls
+	// live Bitfinex and fails offline.
+	confServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(confBody))
+	}))
+	defer confServer.Close()
+
 	a := New()
 	a.baseURL = fs.URL
+	a.confURL = confServer.URL
 	a.pollInterval = 50 * time.Millisecond
 	a.initialBackoff = 10 * time.Millisecond
 	a.maxBackoff = 100 * time.Millisecond
@@ -248,8 +309,16 @@ func TestRunReturnsPromptlyOnCancellation(t *testing.T) {
 	fs := newFlakyServer(1_000_000, "")
 	defer fs.Close()
 
+	// A working stub so Run clears its readiness gate and the cancellation
+	// under test is the one inside poll's backoff sleep.
+	confServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(confBody))
+	}))
+	defer confServer.Close()
+
 	a := New()
 	a.baseURL = fs.URL
+	a.confURL = confServer.URL
 	a.initialBackoff = 5 * time.Second // deliberately long
 	a.maxBackoff = 5 * time.Second
 
@@ -297,6 +366,6 @@ func BenchmarkDecode(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		decode(data, fixedTime)
+		decode(data, fixedTime, testLookup)
 	}
 }
