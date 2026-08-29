@@ -19,6 +19,7 @@ import (
 	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/source/binance"
 	"github.com/samuel-fonseca/driftwatch/internal/source/bitfinex"
+	"github.com/samuel-fonseca/driftwatch/internal/source/kraken"
 	"github.com/samuel-fonseca/driftwatch/internal/store/psql"
 )
 
@@ -44,6 +45,7 @@ func main() {
 		Sources: []source.Source{
 			binance.New(binance.Config{}),
 			bitfinex.New(bitfinex.Config{}),
+			kraken.New(kraken.Config{}),
 		},
 		Store: st,
 		Hub:   h,
