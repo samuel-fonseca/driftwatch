@@ -42,8 +42,8 @@ func main() {
 	h := hub.New()
 	p := pipeline.New(pipeline.Config{
 		Sources: []source.Source{
-			binance.New(),
-			bitfinex.New(),
+			binance.New(binance.Config{}),
+			bitfinex.New(bitfinex.Config{}),
 		},
 		Store: st,
 		Hub:   h,

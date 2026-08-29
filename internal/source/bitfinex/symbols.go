@@ -7,12 +7,13 @@ import (
 	"strings"
 
 	"github.com/samuel-fonseca/driftwatch/internal/normalize"
+	"github.com/samuel-fonseca/driftwatch/internal/source/poller"
 	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
 const (
-	testPrefix = "TEST"
-	confURL    = "https://api-pub.bitfinex.com/v2/conf/" +
+	testPrefix     = "TEST"
+	defaultConfURL = "https://api-pub.bitfinex.com/v2/conf/" +
 		"pub:list:pair:exchange,pub:list:currency,pub:map:currency:sym"
 )
 
@@ -23,8 +24,8 @@ type conf struct {
 }
 
 // tickerLoader satisfies symbols.Loader against Bitfinex's public conf API.
-func (a *Adapter) tickerLoader(ctx context.Context) (symbols.Table, error) {
-	body, err := a.get(ctx, a.confURL)
+func tickerLoader(ctx context.Context, h *poller.HTTP, confURL string) (symbols.Table, error) {
+	body, err := h.Get(ctx, confURL)
 	if err != nil {
 		return nil, fmt.Errorf("loading conf: %w", err)
 	}

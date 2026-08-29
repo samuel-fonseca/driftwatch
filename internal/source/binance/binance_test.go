@@ -6,179 +6,108 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/samuel-fonseca/driftwatch/internal/quote"
+	"github.com/samuel-fonseca/driftwatch/internal/source/poller"
 	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
-var fixedTime = time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+// --- test helpers ---
 
-// testTable stands in for what the registry loads from exchangeInfo. A symbol
-// absent from it is one the venue does not list as spot.
-var testTable = symbols.Table{
-	"BTCUSDT": {Symbol: "BTCUSDT", Base: "BTC", Quote: "USDT", Market: "BTC-USDT"},
-	"BTCUSDC": {Symbol: "BTCUSDC", Base: "BTC", Quote: "USDC", Market: "BTC-USDC"},
-	"ETHUSDT": {Symbol: "ETHUSDT", Base: "ETH", Quote: "USDT", Market: "ETH-USDT"},
-	"SOLUSDT": {Symbol: "SOLUSDT", Base: "SOL", Quote: "USDT", Market: "SOL-USDT"},
+const exchangeInfoBody = `{"symbols":[
+	{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true}
+]}`
+
+func infoServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("request method = %q, want %q", r.Method, http.MethodGet)
+		}
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return server
 }
 
-func testLookup(symbol string) (symbols.Instrument, bool) {
-	inst, ok := testTable[symbol]
-	return inst, ok
+// testLoader mirrors how New binds tickerLoader: to a poller.HTTP and an
+// exchangeInfo URL, yielding the symbols.Loader the poller ultimately calls.
+func testLoader(url string) symbols.Loader {
+	h := poller.NewHTTP(venue, 10*time.Second)
+	return func(ctx context.Context) (symbols.Table, error) {
+		return tickerLoader(ctx, h, url)
+	}
 }
 
-// --- decode tests ---
+// --- parseTicks tests ---
+//
 // Note the format difference from Bitfinex throughout: Binance's numeric
 // fields are JSON STRINGS ("65432.10000000"), not JSON numbers, and the
-// payload is a homogeneous array of objects, not positional arrays --
-// so there's no funding-row-shaped trap here, but there IS a
-// string-parsing failure mode Bitfinex's decode never had to handle.
+// payload is a homogeneous array of objects, not positional arrays -- so
+// there's no funding-row-shaped trap here, but there IS a string-parsing
+// failure mode Bitfinex's parseTicks never had to handle.
+//
+// parseTicks does not filter by symbol; the poller's table lookup drops
+// unlisted symbols, and those drops are covered in internal/source/poller.
 
-func TestDecodeSimpleTradingPair(t *testing.T) {
+func TestParseTicksReadsRow(t *testing.T) {
 	body := `[
 		{"symbol":"BTCUSDT","bidPrice":"65432.10000000","bidQty":"3.50000000","askPrice":"65433.00000000","askQty":"2.10000000"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
+	ticks, err := parseTicks([]byte(body))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("parseTicks() = %v, want nil", err)
 	}
-	if len(quotes) != 2 {
-		t.Fatalf("len(quotes) = %d, want 2 (one bid, one ask)", len(quotes))
-	}
-
-	byWant := map[string]quote.Quote{}
-	for _, q := range quotes {
-		byWant[q.Selection] = q
+	if len(ticks) != 1 {
+		t.Fatalf("len(ticks) = %d, want 1", len(ticks))
 	}
 
-	bid, ok := byWant["bid"]
-	if !ok {
-		t.Fatal("expected a bid quote")
+	got := ticks[0]
+	if got.Symbol != "BTCUSDT" {
+		t.Errorf("Symbol = %q, want %q", got.Symbol, "BTCUSDT")
 	}
-	if bid.Market != "BTC-USDT" || bid.Venue != "binance" || bid.Price != 65432.10 || bid.Size != 3.5 {
-		t.Errorf("bid = %+v, unexpected fields", bid)
+	if got.BidPrice != 65432.10 || got.BidSize != 3.5 {
+		t.Errorf("bid = %v @ %v, want 65432.10 @ 3.5", got.BidPrice, got.BidSize)
 	}
-	if !bid.ObservedAt.Equal(fixedTime) || !bid.ReceivedAt.Equal(fixedTime) {
-		t.Errorf("bid timestamps = %v / %v, want both %v", bid.ObservedAt, bid.ReceivedAt, fixedTime)
+	if got.AskPrice != 65433.00 || got.AskSize != 2.1 {
+		t.Errorf("ask = %v @ %v, want 65433.00 @ 2.1", got.AskPrice, got.AskSize)
 	}
-
-	ask, ok := byWant["ask"]
-	if !ok {
-		t.Fatal("expected an ask quote")
-	}
-	if ask.Price != 65433.00 || ask.Size != 2.1 {
-		t.Errorf("ask = %+v, unexpected fields", ask)
+	if got.ObservedAt.IsZero() {
+		t.Error("ObservedAt is zero; the poller would substitute its own fetch time")
 	}
 }
 
-// Replaces the old longest-suffix-match test: decode no longer parses symbols,
-// so the property to protect is that it never invents a market of its own.
-func TestDecodeUsesRegistryMarket(t *testing.T) {
-	body := `[
-		{"symbol":"ETHUSDT","bidPrice":"3200.50000000","bidQty":"10.00000000","askPrice":"3201.00000000","askQty":"8.00000000"}
-	]`
+// Binance's numbers arriving as JSON strings means strconv.ParseFloat can fail
+// where a JSON number type assertion never could. "Skip, never guess": don't
+// panic, don't treat it as zero, drop the row.
+func TestParseTicksMalformedNumberSkipsRow(t *testing.T) {
+	cases := []struct{ name, row string }{
+		{"bid price", `{"symbol":"BTCUSDT","bidPrice":"not-a-number","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"}`},
+		{"bid size", `{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"","askPrice":"65433.00","askQty":"2.1"}`},
+		{"ask price", `{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"n/a","askQty":"2.1"}`},
+		{"ask size", `{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"65433.00","askQty":"NaN-ish"}`},
+	}
 
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(quotes) != 2 {
-		t.Fatalf("len(quotes) = %d, want 2", len(quotes))
-	}
-	want := testTable["ETHUSDT"].Market
-	for _, q := range quotes {
-		if q.Market != want {
-			t.Errorf("Market = %q, want %q", q.Market, want)
-		}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ticks, err := parseTicks([]byte("[" + c.row + "]"))
+			if err != nil {
+				t.Fatalf("parseTicks() = %v, want nil", err)
+			}
+			// The whole row goes, not just the bad side: a half-read book
+			// would publish one side of a quote the venue never sent.
+			if len(ticks) != 0 {
+				t.Errorf("len(ticks) = %d, want 0 (row is unreadable): %+v", len(ticks), ticks)
+			}
+		})
 	}
 }
 
-// BTCUSDT and BTCUSDC are separate books at different prices. Under the old
-// stablecoin collapse they shared one Key(), so all but one row per poll was
-// dropped by ON CONFLICT DO NOTHING at insert.
-func TestDecodeKeepsStablecoinBooksDistinct(t *testing.T) {
-	body := `[
-		{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"},
-		{"symbol":"BTCUSDC","bidPrice":"65401.00","bidQty":"1.2","askPrice":"65402.00","askQty":"1.4"}
-	]`
-
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(quotes) != 4 {
-		t.Fatalf("len(quotes) = %d, want 4 (two books, two sides each)", len(quotes))
-	}
-
-	seen := map[string]quote.Quote{}
-	for _, q := range quotes {
-		if prev, dup := seen[q.Key()]; dup {
-			t.Errorf("Key() collision %q: %v @ %v and %v @ %v",
-				q.Key(), prev.Market, prev.Price, q.Market, q.Price)
-		}
-		seen[q.Key()] = q
-	}
-}
-
-// TestDecodeZeroPriceSideDropped: same PRD 7.1 rule as Bitfinex -- a
-// zero price means no resting order on that side, not a price of zero.
-func TestDecodeZeroPriceSideDropped(t *testing.T) {
-	body := `[
-		{"symbol":"ETHUSDT","bidPrice":"0.00000000","bidQty":"0.00000000","askPrice":"3201.00000000","askQty":"8.00000000"}
-	]`
-
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(quotes) != 1 {
-		t.Fatalf("len(quotes) = %d, want 1 (bid side is zero, ask side is not)", len(quotes))
-	}
-	if quotes[0].Selection != "ask" {
-		t.Errorf("survivor Selection = %q, want %q", quotes[0].Selection, "ask")
-	}
-}
-
-// TestDecodeMalformedNumberSkipsRow: Binance's numbers are JSON strings,
-// which means a NEW failure mode Bitfinex's decode never had --
-// strconv.ParseFloat can fail on a malformed string in a way a JSON
-// number type assertion never could. "Skip, never guess" applies here
-// too: don't panic, don't treat it as zero, just drop the row.
-func TestDecodeMalformedNumberSkipsRow(t *testing.T) {
-	body := `[
-		{"symbol":"BTCUSDT","bidPrice":"not-a-number","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"}
-	]`
-
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(quotes) != 0 {
-		t.Fatalf("expected malformed row to be skipped entirely, got %+v", quotes)
-	}
-}
-
-// "Skip, never guess" still holds; a registry miss now means Binance does not
-// list the symbol as active spot.
-func TestDecodeUnnormalizableSymbolDropped(t *testing.T) {
-	body := `[
-		{"symbol":"BTCXYZ","bidPrice":"100.0","bidQty":"1.0","askPrice":"101.0","askQty":"1.0"}
-	]`
-
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(quotes) != 0 {
-		t.Fatalf("expected unnormalizable symbol to be dropped, got %+v", quotes)
-	}
-}
-
-func TestDecodeMixedBatch(t *testing.T) {
+// Only unparseable rows are dropped here. Zero prices and unlisted symbols
+// both survive parsing -- the poller decides what to do with them.
+func TestParseTicksMixedBatch(t *testing.T) {
 	body := `[
 		{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"},
 		{"symbol":"ETHUSDT","bidPrice":"0.0","bidQty":"0.0","askPrice":"3201.00","askQty":"8.0"},
@@ -186,169 +115,201 @@ func TestDecodeMixedBatch(t *testing.T) {
 		{"symbol":"SOLUSDT","bidPrice":"not-a-number","bidQty":"1.0","askPrice":"150.0","askQty":"1.0"}
 	]`
 
-	quotes, err := decode([]byte(body), fixedTime, testLookup)
+	ticks, err := parseTicks([]byte(body))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("parseTicks() = %v, want nil", err)
 	}
-	// BTCUSDT -> 2, ETHUSDT -> 1 (zero bid dropped), BTCXYZ -> 0
-	// (unnormalizable), SOLUSDT -> 0 (malformed) = 3 total.
-	if len(quotes) != 3 {
-		t.Fatalf("len(quotes) = %d, want 3", len(quotes))
+	if len(ticks) != 3 {
+		t.Fatalf("len(ticks) = %d, want 3 (only the malformed SOLUSDT row dropped): %+v", len(ticks), ticks)
+	}
+	for _, tick := range ticks {
+		if tick.Symbol == "SOLUSDT" {
+			t.Error("the malformed row survived")
+		}
 	}
 }
 
-func TestDecodeEmptyArray(t *testing.T) {
-	quotes, err := decode([]byte(`[]`), fixedTime, testLookup)
+func TestParseTicksEmptyArray(t *testing.T) {
+	ticks, err := parseTicks([]byte(`[]`))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("parseTicks() = %v, want nil", err)
 	}
-	if len(quotes) != 0 {
-		t.Fatalf("expected 0 quotes for an empty array, got %+v", quotes)
+	if len(ticks) != 0 {
+		t.Fatalf("expected 0 ticks for an empty array, got %+v", ticks)
 	}
 }
 
-// --- fetch tests ---
+func TestParseTicksMalformedJSONIsError(t *testing.T) {
+	if _, err := parseTicks([]byte(`not json at all`)); err == nil {
+		t.Error("parseTicks() = nil error for a non-JSON body, want an error")
+	}
+}
 
-func TestFetchReturnsBody(t *testing.T) {
+// --- parseTickers tests ---
+
+func TestParseTickersBuildsInstruments(t *testing.T) {
+	body := `{"symbols":[
+		{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true},
+		{"symbol":"ETHBTC","status":"TRADING","baseAsset":"ETH","quoteAsset":"BTC","isSpotTradingAllowed":true}
+	]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if len(table) != 2 {
+		t.Fatalf("len(table) = %d, want 2: %+v", len(table), table)
+	}
+
+	want := symbols.Instrument{Symbol: "BTCUSDT", Base: "BTC", Quote: "USDT", Market: "BTC-USDT"}
+	if got := table["BTCUSDT"]; got != want {
+		t.Errorf("table[\"BTCUSDT\"] = %+v, want %+v", got, want)
+	}
+	// The venue-native symbol is the key, and Market is the canonical pair --
+	// the whole point of the normalization.
+	if got := table["ETHBTC"].Market; got != "ETH-BTC" {
+		t.Errorf("table[\"ETHBTC\"].Market = %q, want %q", got, "ETH-BTC")
+	}
+}
+
+func TestParseTickersEmptySymbolsIsEmptyTable(t *testing.T) {
+	table, err := parseTickers([]byte(`{"symbols":[]}`))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if table == nil {
+		t.Fatal("parseTickers() returned a nil table, want a non-nil empty one")
+	}
+	if len(table) != 0 {
+		t.Errorf("len(table) = %d, want 0", len(table))
+	}
+}
+
+func TestParseTickersMalformedJSONIsError(t *testing.T) {
+	if _, err := parseTickers([]byte(`{"symbols":[`)); err == nil {
+		t.Error("parseTickers() = nil error for truncated JSON, want an error")
+	}
+}
+
+func TestParseTickersIgnoresUnknownFields(t *testing.T) {
+	body := `{"timezone":"UTC","serverTime":1700000000000,"symbols":[
+		{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true,"filters":[{"filterType":"PRICE_FILTER"}]}
+	]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if _, ok := table["BTCUSDT"]; !ok {
+		t.Error("BTCUSDT missing; extra exchangeInfo fields should be ignored, not fatal")
+	}
+}
+
+// --- filter tests ---
+//
+// The intent is "list only symbols that are TRADING *and* spot-tradable".
+// Each case below names which half of that rule it exercises.
+
+func TestParseTickersKeepsTradingSpotSymbol(t *testing.T) {
+	body := `{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true}]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if _, ok := table["BTCUSDT"]; !ok {
+		t.Error("BTCUSDT was filtered out, want it kept (TRADING and spot-allowed)")
+	}
+}
+
+func TestParseTickersDropsHaltedNonSpotSymbol(t *testing.T) {
+	body := `{"symbols":[{"symbol":"DEADUSDT","status":"BREAK","baseAsset":"DEAD","quoteAsset":"USDT","isSpotTradingAllowed":false}]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if _, ok := table["DEADUSDT"]; ok {
+		t.Error("DEADUSDT was kept, want it dropped (neither TRADING nor spot-allowed)")
+	}
+}
+
+func TestParseTickersDropsHaltedSpotSymbol(t *testing.T) {
+	// Halted mid-session but still flagged spot-tradable: quoting it would
+	// publish prices for a market that isn't trading.
+	body := `{"symbols":[{"symbol":"HALTUSDT","status":"BREAK","baseAsset":"HALT","quoteAsset":"USDT","isSpotTradingAllowed":true}]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if _, ok := table["HALTUSDT"]; ok {
+		t.Error("HALTUSDT (status BREAK) was kept, want it dropped -- status must be TRADING")
+	}
+}
+
+func TestParseTickersDropsTradingNonSpotSymbol(t *testing.T) {
+	// TRADING but margin/futures-only: not a spot market, so not ours.
+	body := `{"symbols":[{"symbol":"MARGINUSDT","status":"TRADING","baseAsset":"MARGIN","quoteAsset":"USDT","isSpotTradingAllowed":false}]}`
+
+	table, err := parseTickers([]byte(body))
+	if err != nil {
+		t.Fatalf("parseTickers() = %v, want nil", err)
+	}
+	if _, ok := table["MARGINUSDT"]; ok {
+		t.Error("MARGINUSDT (isSpotTradingAllowed false) was kept, want it dropped -- spot only")
+	}
+}
+
+// --- tickerLoader tests ---
+
+func TestTickerLoaderReturnsTable(t *testing.T) {
+	server := infoServer(t, exchangeInfoBody)
+
+	table, err := testLoader(server.URL)(context.Background())
+	if err != nil {
+		t.Fatalf("tickerLoader() = %v, want nil", err)
+	}
+	if _, ok := table["BTCUSDT"]; !ok {
+		t.Errorf("table missing BTCUSDT: %+v", table)
+	}
+}
+
+func TestTickerLoaderNonOKStatusIsError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[{"symbol":"BTCUSDT","bidPrice":"100.0","bidQty":"1.0","askPrice":"101.0","askQty":"1.0"}]`))
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer server.Close()
 
-	a := New()
-	a.baseURL = server.URL
-
-	body, err := a.fetch(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(body) == 0 {
-		t.Error("expected a non-empty body")
+	if _, err := testLoader(server.URL)(context.Background()); err == nil {
+		t.Error("tickerLoader() = nil error for a 429, want an error")
 	}
 }
 
-func TestFetchNonOKStatusIsError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
+func TestTickerLoaderMalformedBodyIsError(t *testing.T) {
+	server := infoServer(t, `not json at all`)
 
-	a := New()
-	a.baseURL = server.URL
-
-	_, err := a.fetch(context.Background())
-	if err == nil {
-		t.Error("expected an error for a non-200 status, got nil")
+	if _, err := testLoader(server.URL)(context.Background()); err == nil {
+		t.Error("tickerLoader() = nil error for a non-JSON body, want an error")
 	}
 }
 
-// --- Run tests ---
+// --- registry integration ---
 
-type flakyServer struct {
-	*httptest.Server
-	requests  atomic.Int32
-	failCount int32
-}
+func TestRegistryLoadsFromTickerLoader(t *testing.T) {
+	server := infoServer(t, exchangeInfoBody)
 
-func newFlakyServer(failCount int32, body string) *flakyServer {
-	fs := &flakyServer{failCount: failCount}
-	fs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := fs.requests.Add(1)
-		if n <= fs.failCount {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(body))
-	}))
-	return fs
-}
-
-func TestRunRecoversAfterTransientFailures(t *testing.T) {
-	fs := newFlakyServer(3, `[{"symbol":"BTCUSDT","bidPrice":"100.0","bidQty":"1.0","askPrice":"101.0","askQty":"1.0"}]`)
-	defer fs.Close()
-
-	// Run loads the symbol table before polling; without a stub this pulls
-	// several MB from live Binance and fails offline.
-	symbolsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(exchangeInfoBody))
-	}))
-	defer symbolsServer.Close()
-
-	a := New()
-	a.baseURL = fs.URL
-	a.exchangeInfoURL = symbolsServer.URL
-	a.pollInterval = 50 * time.Millisecond
-	a.initialBackoff = 10 * time.Millisecond
-	a.maxBackoff = 100 * time.Millisecond
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	out := make(chan quote.Quote, 10)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- a.Run(ctx, out)
-	}()
-
-	select {
-	case q := <-out:
-		if q.Market != "BTC-USDT" {
-			t.Errorf("got quote for %q, want BTC-USDT", q.Market)
-		}
-	case err := <-errCh:
-		t.Fatalf("Run returned early with err=%v before delivering any quote", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("no quote arrived within 2s despite the server recovering after 3 failures")
+	r := symbols.NewRegistry(testLoader(server.URL), time.Hour)
+	if err := r.Load(context.Background()); err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
 	}
 
-	if got := fs.requests.Load(); got < 4 {
-		t.Errorf("server only saw %d requests, want at least 4 (3 failures + 1 success)", got)
+	inst, ok := r.Lookup("BTCUSDT")
+	if !ok {
+		t.Fatal("Lookup(\"BTCUSDT\") = false, want true")
 	}
-
-	cancel()
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Error("expected a non-nil error (ctx.Err()) after cancellation")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Run did not return within 1s of cancellation")
-	}
-}
-
-func TestRunReturnsPromptlyOnCancellation(t *testing.T) {
-	fs := newFlakyServer(1_000_000, "")
-	defer fs.Close()
-
-	a := New()
-	a.baseURL = fs.URL
-	a.initialBackoff = 5 * time.Second
-	a.maxBackoff = 5 * time.Second
-
-	ctx, cancel := context.WithCancel(context.Background())
-	out := make(chan quote.Quote, 10)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- a.Run(ctx, out)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	start := time.Now()
-	cancel()
-
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Error("expected a non-nil error (ctx.Err()) on cancellation")
-		}
-		if elapsed := time.Since(start); elapsed > time.Second {
-			t.Errorf("Run took %v to return -- too slow", elapsed)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run never returned after context cancellation")
+	if inst.Market != "BTC-USDT" {
+		t.Errorf("Market = %q, want %q", inst.Market, "BTC-USDT")
 	}
 }
 
@@ -365,14 +326,12 @@ func buildLargeFixture(n int) []byte {
 	return []byte("[" + strings.Join(rows, ",") + "]")
 }
 
-func BenchmarkDecode(b *testing.B) {
+func BenchmarkParseTicks(b *testing.B) {
 	data := buildLargeFixture(1000)
-	fixedTime := time.Now()
 
 	b.ReportAllocs()
-	b.ResetTimer()
 
 	for b.Loop() {
-		decode(data, fixedTime, testLookup)
+		parseTicks(data)
 	}
 }
