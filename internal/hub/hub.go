@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,7 +22,7 @@ type Event struct {
 type subscriber struct {
 	ch    chan Event
 	kill  chan struct{}
-	drops int
+	drops atomic.Int32
 }
 
 type Hub struct {
@@ -78,24 +79,42 @@ func (h *Hub) unsubscribe(id int64) {
 
 func (h *Hub) Publish(e Event) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	h.published++
-
+	ids := make([]int64, 0, len(h.subscribers))
+	subs := make([]*subscriber, 0, len(h.subscribers))
 	for id, sub := range h.subscribers {
+		ids, subs = append(ids, id), append(subs, sub)
+	}
+	h.mu.Unlock()
+
+	var dropped int64
+	var doomed []int64
+	for i, sub := range subs {
 		select {
 		case sub.ch <- e:
+			sub.drops.Store(0)
 		default:
-			h.dropped++
-			sub.drops++
-
-			if sub.drops >= dropBudget {
-				close(sub.kill)
-				delete(h.subscribers, id)
-				h.evicted++
+			dropped++
+			if sub.drops.Add(1) >= dropBudget {
+				doomed = append(doomed, ids[i])
 			}
 		}
 	}
+
+	if dropped == 0 {
+		return
+	}
+
+	h.mu.Lock()
+	h.dropped += dropped
+	for _, id := range doomed {
+		if sub, ok := h.subscribers[id]; ok {
+			close(sub.kill)
+			delete(h.subscribers, id)
+			h.evicted++
+		}
+	}
+	h.mu.Unlock()
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {

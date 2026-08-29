@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log"
@@ -39,27 +40,13 @@ type Pipeline struct {
 }
 
 func (c *Config) ApplyDefaults() {
-	if c.BufferCapacity == 0 {
-		c.BufferCapacity = 16384
-	}
-	if c.DedupeCapacity == 0 {
-		c.DedupeCapacity = 16384
-	}
-	if c.EdgeThresholdBps == 0 {
-		c.EdgeThresholdBps = 5
-	}
-	if c.StaleThreshold == 0 {
-		c.StaleThreshold = 2 * time.Second
-	}
-	if c.NumWorkers == 0 {
-		c.NumWorkers = 4
-	}
-	if c.BatchSize == 0 {
-		c.BatchSize = 256
-	}
-	if c.RawChannelSize == 0 {
-		c.RawChannelSize = 4096
-	}
+	c.BufferCapacity = cmp.Or(c.BufferCapacity, 16384)
+	c.DedupeCapacity = cmp.Or(c.DedupeCapacity, 16384)
+	c.EdgeThresholdBps = cmp.Or(c.EdgeThresholdBps, 5)
+	c.StaleThreshold = cmp.Or(c.StaleThreshold, 30*time.Second)
+	c.NumWorkers = cmp.Or(c.NumWorkers, 4)
+	c.BatchSize = cmp.Or(c.BatchSize, 256)
+	c.RawChannelSize = cmp.Or(c.RawChannelSize, 4096)
 }
 
 func New(cfg Config) *Pipeline {
