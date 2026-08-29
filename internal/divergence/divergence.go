@@ -29,9 +29,10 @@ type Detector struct {
 	suppressedInvalidSelection,
 	suppressedIncompleteBook,
 	suppressedNotCrossed,
-	SuppressedSameVenue,
+	suppressedSameVenue,
 	suppressedBelowThreshold,
-	suppressedStale int64
+	suppressedStale,
+	suppressedStaleArrival int64
 }
 
 func New(edgeThresholdBps float64, staleThreshold time.Duration) *Detector {
@@ -63,7 +64,7 @@ func (d *Detector) Stats() Stats {
 		SuppressedInvalidSelection: d.suppressedInvalidSelection,
 		SuppressedIncompleteBook:   d.suppressedIncompleteBook,
 		SuppressedNotCrossed:       d.suppressedNotCrossed,
-		SuppressedSameVenue:        d.SuppressedSameVenue,
+		SuppressedSameVenue:        d.suppressedSameVenue,
 		SuppressedBelowThreshold:   d.suppressedBelowThreshold,
 		SuppressedStale:            d.suppressedStale,
 	}
@@ -78,6 +79,12 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	// return early without storing
 	if q.Selection != "bid" && q.Selection != "ask" {
 		d.suppressedInvalidSelection++
+		return nil
+	}
+
+	if prev, ok := d.latest[q.Market][q.Selection][q.Venue]; ok &&
+		q.ObservedAt.Before(prev.ObservedAt) {
+		d.suppressedStaleArrival++
 		return nil
 	}
 
@@ -117,7 +124,7 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	}
 
 	if bestAsk.Venue == bestBid.Venue {
-		d.SuppressedSameVenue++
+		d.suppressedSameVenue++
 		return nil
 	}
 
