@@ -3,54 +3,38 @@ package kraken
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/samuel-fonseca/driftwatch/internal/normalize"
 	"github.com/samuel-fonseca/driftwatch/internal/source/poller"
 	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
-const (
-	defaultAssetsURL     = "https://api.kraken.com/0/public/Assets"
-	defaultAssetPairsURL = "https://api.kraken.com/0/public/AssetPairs"
-)
+const defaultAssetPairsURL = "https://api.kraken.com/0/public/AssetPairs"
 
-type assetPair struct {
-	AltName string `json:"altname"`
-	WsName  string `json:"wsname"`
-	Base    string `json:"base"`
-	Quote   string `json:"quote"`
-	Status  string `json:"status"` // online, cancel_only
-}
-
-type asset struct {
-	Class   string `json:"aclass"`
-	AltName string `json:"altname"`
-	Status  string `json:"status"` // enabled, withdrawal_only
-}
-
-func tickerLoader(ctx context.Context, h *poller.HTTP, assetsURL, assetPairsURL string) (symbols.Table, error) {
-	panic("not implemented")
-	// assetPairs, err := fetchAssetPairs(ctx, h, assetPairsURL)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// assets, err := fetchAssets(ctx, h, assetsURL)
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// return nil, nil
-}
-
-func fetchAssetPairs(ctx context.Context, h *poller.HTTP, url string) ([]assetPair, error) {
-	body, err := h.Get(ctx, url)
+func tickerLoader(ctx context.Context, h *poller.HTTP, assetPairsURL string) (symbols.Table, error) {
+	body, err := h.Get(ctx, assetPairsURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching asset pairs: %w", err)
 	}
 
+	table, err := buildTable(body)
+	if err != nil {
+		return nil, fmt.Errorf("parsing pairs: %w", err)
+	}
+	return table, nil
+}
+
+func buildTable(body []byte) (symbols.Table, error) {
+	type pair struct {
+		WsName string `json:"wsname"`
+		Status string `json:"status"`
+	}
 	var resp struct {
-		Error  []string             `json:"error"`
-		Result map[string]assetPair `json:"result"`
+		Error  []string        `json:"error"`
+		Result map[string]pair `json:"result"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshalling asset pairs: %w", err)
@@ -58,41 +42,33 @@ func fetchAssetPairs(ctx context.Context, h *poller.HTTP, url string) ([]assetPa
 	if len(resp.Error) > 0 {
 		return nil, fmt.Errorf("Kraken returned: %v", resp.Error)
 	}
+	if len(resp.Result) == 0 {
+		return nil, errors.New("asset pairs returned no results")
+	}
 
-	assetPairs := make([]assetPair, 0, len(resp.Result))
-	for _, pair := range resp.Result {
+	table := make(symbols.Table)
+	for symbol, pair := range resp.Result {
 		if pair.Status != "online" {
 			continue
 		}
-		assetPairs = append(assetPairs, pair)
-	}
-	return assetPairs, nil
-}
-
-func fetchAssets(ctx context.Context, h *poller.HTTP, url string) ([]asset, error) {
-	body, err := h.Get(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("fetching assets: %w", err)
-	}
-
-	var resp struct {
-		Error  []string         `json:"error"`
-		Result map[string]asset `json:"result"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshalling assets: %w", err)
-	}
-	if len(resp.Error) > 0 {
-		return nil, fmt.Errorf("Kraken returned: %v", resp.Error)
-	}
-
-	assets := make([]asset, 0, len(resp.Result))
-	for _, asset := range resp.Result {
-		if asset.Status != "enabled" {
+		base, quote, ok := strings.Cut(pair.WsName, "/")
+		if !ok || base == "" || quote == "" {
 			continue
 		}
-		assets = append(assets, asset)
+		base = normalize.CanonicalAsset(base)
+		quote = normalize.CanonicalAsset(quote)
+		table[symbol] = symbols.Instrument{
+			Symbol: symbol,
+			Base:   base,
+			Quote:  quote,
+			Market: normalize.Market(base, quote),
+		}
 	}
-
-	return assets, nil
+	if len(table) == 0 {
+		return nil, fmt.Errorf(
+			"all %d asset pairs were dropped -- check wsname/status",
+			len(resp.Result),
+		)
+	}
+	return table, nil
 }

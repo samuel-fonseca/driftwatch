@@ -18,13 +18,12 @@ const (
 )
 
 type Config struct {
-	TickersURL, AssetsURL, AssetPairsURL string
-	Tuning                               poller.Tuning
+	TickersURL, AssetPairsURL string
+	Tuning                    poller.Tuning
 }
 
 func (c Config) withDefaults() Config {
 	c.TickersURL = cmp.Or(c.TickersURL, defaultTickersURL)
-	c.AssetsURL = cmp.Or(c.AssetsURL, defaultAssetsURL)
 	c.AssetPairsURL = cmp.Or(c.AssetPairsURL, defaultAssetPairsURL)
 	c.Tuning = c.Tuning.WithDefaults()
 	return c
@@ -44,7 +43,7 @@ func New(cfg Config) *Adapter {
 		Tuning:     cfg.Tuning,
 		Parse:      parseTicks,
 		Loader: func(ctx context.Context) (symbols.Table, error) {
-			return tickerLoader(ctx, h, cfg.AssetsURL, cfg.AssetPairsURL)
+			return tickerLoader(ctx, h, cfg.AssetPairsURL)
 		},
 	})}
 }
