@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samuel-fonseca/driftwatch/internal/buffer"
 	"github.com/samuel-fonseca/driftwatch/internal/dedupe"
 	"github.com/samuel-fonseca/driftwatch/internal/divergence"
@@ -19,9 +20,10 @@ import (
 )
 
 type Config struct {
-	Sources []source.Source
-	Store   store.Store
-	Hub     *hub.Hub
+	Sources  []source.Source
+	Store    store.Store
+	Hub      *hub.Hub
+	Registry prometheus.Registerer
 
 	BufferCapacity   int
 	DedupeCapacity   int
@@ -50,6 +52,9 @@ func (c *Config) ApplyDefaults() {
 	c.NumWorkers = cmp.Or(c.NumWorkers, 4)
 	c.BatchSize = cmp.Or(c.BatchSize, 256)
 	c.RawChannelSize = cmp.Or(c.RawChannelSize, 4096)
+	if c.Registry == nil {
+		c.Registry = metrics.Registry
+	}
 }
 
 func New(cfg Config) *Pipeline {
@@ -65,7 +70,7 @@ func New(cfg Config) *Pipeline {
 			cfg.CollisionRatio,
 		),
 	}
-	metrics.Registry.MustRegister(metrics.PipelineCollector{
+	cfg.Registry.MustRegister(metrics.PipelineCollector{
 		Buffer:     p.buf,
 		Hub:        cfg.Hub,
 		Dedupe:     p.dedup,
@@ -118,7 +123,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		wg.Go(func() { p.worker(ctx) })
 	}
 
-	return nil
+	wg.Wait()
+	return ctx.Err()
 }
 
 func (p *Pipeline) worker(ctx context.Context) {
