@@ -32,11 +32,13 @@ type Hub struct {
 	published   int64
 	dropped     int64
 	evicted     int64
+	heartbeat   time.Duration
 }
 
 func New() *Hub {
 	return &Hub{
 		subscribers: make(map[int64]*subscriber),
+		heartbeat:   heartbeatInterval,
 	}
 }
 
@@ -57,6 +59,10 @@ func (h *Hub) Stats() Stats {
 }
 
 func (h *Hub) subscribe() (int64, *subscriber) {
+	return h.subscribeWithBuffer(subscriberBufferSize)
+}
+
+func (h *Hub) subscribeWithBuffer(n int) (int64, *subscriber) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -64,7 +70,7 @@ func (h *Hub) subscribe() (int64, *subscriber) {
 	h.nextID++
 
 	sub := &subscriber{
-		ch:   make(chan Event, subscriberBufferSize),
+		ch:   make(chan Event, n),
 		kill: make(chan struct{}),
 	}
 	h.subscribers[id] = sub
@@ -136,7 +142,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id, sub := h.subscribe()
 	defer h.unsubscribe(id)
 
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(h.heartbeat)
 	defer ticker.Stop()
 
 	for {
