@@ -1,7 +1,7 @@
 package divergence
 
 import (
-	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -9,21 +9,29 @@ import (
 )
 
 type Signal struct {
-	Market     string
-	BidVenue   string
-	BidPrice   float64
-	AskVenue   string
-	AskPrice   float64
+	Market string
+
+	BidVenue          string
+	BidPrice, BidSize float64
+
+	AskVenue          string
+	AskPrice, AskSize float64
+
 	EdgeBps    float64
 	StalestLeg time.Duration
 	DetectedAt time.Time
 }
 
 type Detector struct {
-	mu               sync.Mutex
-	latest           map[string]map[string]map[string]quote.Quote
-	edgeThresholdBps float64
-	staleThreshold   time.Duration
+	mu             sync.Mutex
+	latest         map[string]map[string]map[string]quote.Quote
+	aliveAt        map[string]time.Time
+	collided       map[string]struct{}
+	staleThreshold time.Duration
+
+	edgeThresholdBps,
+	collisionRatio float64
+
 	observed,
 	emitted,
 	suppressedInvalidSelection,
@@ -32,14 +40,18 @@ type Detector struct {
 	suppressedSameVenue,
 	suppressedBelowThreshold,
 	suppressedStale,
-	suppressedStaleArrival int64
+	suppressedStaleArrival,
+	suppressedCollision int64
 }
 
-func New(edgeThresholdBps float64, staleThreshold time.Duration) *Detector {
+func New(edgeThresholdBps float64, staleThreshold time.Duration, collisionRatio float64) *Detector {
 	return &Detector{
 		latest:           make(map[string]map[string]map[string]quote.Quote),
+		aliveAt:          make(map[string]time.Time),
+		collided:         make(map[string]struct{}),
 		edgeThresholdBps: edgeThresholdBps,
 		staleThreshold:   staleThreshold,
+		collisionRatio:   collisionRatio,
 	}
 }
 
@@ -51,7 +63,12 @@ type Stats struct {
 	SuppressedNotCrossed,
 	SuppressedSameVenue,
 	SuppressedBelowThreshold,
-	SuppressedStale int64
+	SuppressedStale,
+	SuppressedStaleArrival,
+	SuppressedCollision,
+	MarketsTracked,
+	MarketsCrossable,
+	MarketsCollided int64
 }
 
 func (d *Detector) Stats() Stats {
@@ -67,6 +84,71 @@ func (d *Detector) Stats() Stats {
 		SuppressedSameVenue:        d.suppressedSameVenue,
 		SuppressedBelowThreshold:   d.suppressedBelowThreshold,
 		SuppressedStale:            d.suppressedStale,
+		SuppressedStaleArrival:     d.suppressedStaleArrival,
+		SuppressedCollision:        d.suppressedCollision,
+		MarketsTracked:             int64(len(d.latest)),
+		MarketsCrossable:           d.marketsCrossable(time.Now()),
+		MarketsCollided:            int64(len(d.collided)),
+	}
+}
+
+func (d *Detector) Collided() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	markets := make([]string, 0, len(d.collided))
+	for market := range d.collided {
+		markets = append(markets, market)
+	}
+	slices.Sort(markets)
+	return markets
+}
+
+// marketsCrossable counts the markets that could actually emit right now: a
+// live bid on one venue and a live ask on a different one. A market that never
+// clears this bar is structurally incapable of signalling, which the
+// suppression counters alone do not distinguish from a market that simply
+// never crossed.
+func (d *Detector) marketsCrossable(now time.Time) int64 {
+	var n int64
+	for _, sides := range d.latest {
+		bidVenue, bidCount := d.liveVenues(sides["bid"], now)
+		askVenue, askCount := d.liveVenues(sides["ask"], now)
+		if bidCount == 0 || askCount == 0 {
+			continue
+		}
+		// Both sides quoted, but by the same lone venue: cannot cross.
+		if bidCount == 1 && askCount == 1 && bidVenue == askVenue {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// liveVenues counts the live venues on one side of a book and returns one of
+// their names, which is all marketsCrossable needs to tell a lone venue quoting
+// both sides from two that can actually cross. Returning a count rather than a
+// slice keeps this allocation-free: it runs for every market on every scrape,
+// holding the same lock Observe needs.
+func (d *Detector) liveVenues(byVenue map[string]quote.Quote, now time.Time) (venue string, n int) {
+	for v := range byVenue {
+		if d.isLive(v, now) {
+			venue = v
+			n++
+		}
+	}
+	return venue, n
+}
+
+func (d *Detector) MarkAlive(quotes []quote.Quote) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, q := range quotes {
+		if at, ok := d.aliveAt[q.Venue]; !ok || q.ObservedAt.After(at) {
+			d.aliveAt[q.Venue] = q.ObservedAt
+		}
 	}
 }
 
@@ -75,13 +157,10 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	defer d.mu.Unlock()
 
 	d.observed++
-
-	// return early without storing
 	if q.Selection != "bid" && q.Selection != "ask" {
 		d.suppressedInvalidSelection++
 		return nil
 	}
-
 	if prev, ok := d.latest[q.Market][q.Selection][q.Venue]; ok &&
 		q.ObservedAt.Before(prev.ObservedAt) {
 		d.suppressedStaleArrival++
@@ -98,23 +177,51 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 
 	var bestBid, bestAsk quote.Quote
 	var haveBid, haveAsk bool
+	var skippedStale bool
+	var lowestBid, highestAsk float64
 
-	for _, bidQuote := range d.latest[q.Market]["bid"] {
+	now := time.Now()
+	for venue, bidQuote := range d.latest[q.Market]["bid"] {
+		if !d.isLive(venue, now) {
+			skippedStale = true
+			continue
+		}
 		if !haveBid || bidQuote.Price > bestBid.Price {
 			bestBid = bidQuote
-			haveBid = true
 		}
+		if !haveBid || bidQuote.Price < lowestBid {
+			lowestBid = bidQuote.Price
+		}
+		haveBid = true
 	}
 
-	for _, askQuote := range d.latest[q.Market]["ask"] {
+	for venue, askQuote := range d.latest[q.Market]["ask"] {
+		if !d.isLive(venue, now) {
+			skippedStale = true
+			continue
+		}
 		if !haveAsk || askQuote.Price < bestAsk.Price {
 			bestAsk = askQuote
-			haveAsk = true
 		}
+		if !haveAsk || askQuote.Price > highestAsk {
+			highestAsk = askQuote.Price
+		}
+		haveAsk = true
 	}
 
 	if !haveBid || !haveAsk {
-		d.suppressedIncompleteBook++
+		if skippedStale {
+			d.suppressedStale++
+		} else {
+			d.suppressedIncompleteBook++
+		}
+		return nil
+	}
+
+	if dispersed(bestBid.Price, lowestBid, d.collisionRatio) ||
+		dispersed(highestAsk, bestAsk.Price, d.collisionRatio) {
+		d.suppressedCollision++
+		d.collided[q.Market] = struct{}{}
 		return nil
 	}
 
@@ -136,25 +243,28 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 		return nil
 	}
 
-	bestAskTimeSinceObserved := time.Since(bestAsk.ObservedAt)
-	bestBidTimeSinceObserved := time.Since(bestBid.ObservedAt)
-	stalestLeg := time.Duration(math.Max(float64(bestAskTimeSinceObserved), float64(bestBidTimeSinceObserved)))
-
-	if stalestLeg > d.staleThreshold {
-		d.suppressedStale++
-		return nil
-	}
-
 	d.emitted++
+	stalestLeg := max(now.Sub(d.aliveAt[bestBid.Venue]), now.Sub(d.aliveAt[bestAsk.Venue]))
 
 	return &Signal{
 		Market:     q.Market,
 		BidVenue:   bestBid.Venue,
 		BidPrice:   bestBid.Price,
+		BidSize:    bestBid.Size,
 		AskVenue:   bestAsk.Venue,
 		AskPrice:   bestAsk.Price,
+		AskSize:    bestAsk.Size,
 		EdgeBps:    edgeBps,
 		StalestLeg: stalestLeg,
 		DetectedAt: time.Now(),
 	}
+}
+
+func dispersed(high, low, ratio float64) bool {
+	return ratio > 1 && low > 0 && high/low > ratio
+}
+
+func (d *Detector) isLive(venue string, now time.Time) bool {
+	at, ok := d.aliveAt[venue]
+	return ok && now.Sub(at) <= d.staleThreshold
 }
