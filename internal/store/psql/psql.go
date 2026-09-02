@@ -129,24 +129,36 @@ func nextMidnightUTC(now time.Time) time.Time {
 }
 
 func (s *Store) WriteBatch(ctx context.Context, batch []quote.Quote) error {
-	backoffDuration := 10 * time.Millisecond
-	for range 5 {
-		err := s.writeBatchOnce(ctx, batch)
+	return retryOnDeadlock(ctx, func(ctx context.Context) error {
+		return s.writeBatchOnce(ctx, batch)
+	})
+}
+
+const (
+	deadlockCode       = "40P01"
+	maxDeadlockRetries = 5
+	deadlockBackoff    = 10 * time.Millisecond
+)
+
+func retryOnDeadlock(ctx context.Context, fn func(context.Context) error) error {
+	wait := deadlockBackoff
+	for range maxDeadlockRetries {
+		err := fn(ctx)
 		if err == nil {
 			return nil
 		}
 
 		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+		if !errors.As(err, &pgErr) || pgErr.Code != deadlockCode {
 			return err // not a deadlock -- don't retry
 		}
 
-		if sleepErr := backoff.Sleep(ctx, backoff.Jitter(backoffDuration)); sleepErr != nil {
+		if sleepErr := backoff.Sleep(ctx, backoff.Jitter(wait)); sleepErr != nil {
 			return sleepErr
 		}
-		backoffDuration *= 2
+		wait *= 2
 	}
-	return fmt.Errorf("WriteBatch: exhausted retries after repeated deadlocks.")
+	return fmt.Errorf("exhausted %d retries after repeated deadlocks", maxDeadlockRetries)
 }
 
 func (s *Store) writeBatchOnce(ctx context.Context, batch []quote.Quote) error {
