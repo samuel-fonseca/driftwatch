@@ -32,46 +32,39 @@ func New(capacity int) *Buffer {
 }
 
 func (b *Buffer) Push(q quote.Quote) {
-	func() {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-
-		b.pushed++
-
-		key := q.Key()
-		if element, found := b.index[key]; found {
-			entry := element.Value.(*entry)
-			entry.quote = q
-			b.coalesced++
-
-			if b.order.Len() > b.maxDepth {
-				b.maxDepth = b.order.Len()
-			}
-
-			return
-		}
-
-		if b.order.Len() >= b.capacity {
-			oldest := b.order.Front()
-			oldestEntry := oldest.Value.(*entry)
-			delete(b.index, oldestEntry.key)
-			b.order.Remove(oldest)
-			b.evicted++
-		}
-
-		newEntry := &entry{key: key, quote: q}
-		b.order.PushBack(newEntry)
-		b.index[key] = b.order.Back()
-
-		if b.order.Len() > b.maxDepth {
-			b.maxDepth = b.order.Len()
-		}
-	}()
+	b.insert(q)
 
 	select {
 	case b.notify <- struct{}{}:
 	default:
 	}
+}
+
+func (b *Buffer) insert(q quote.Quote) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.pushed++
+	defer func() {
+		b.maxDepth = max(b.maxDepth, b.order.Len())
+	}()
+
+	key := q.Key()
+	if element, found := b.index[key]; found {
+		element.Value.(*entry).quote = q
+		b.coalesced++
+		return
+	}
+
+	if b.order.Len() >= b.capacity {
+		oldest := b.order.Front()
+		oldestEntry := oldest.Value.(*entry)
+		delete(b.index, oldestEntry.key)
+		b.order.Remove(oldest)
+		b.evicted++
+	}
+
+	b.index[key] = b.order.PushBack(&entry{key: key, quote: q})
 }
 
 func (b *Buffer) TakeBatch(ctx context.Context, max int) ([]quote.Quote, error) {
