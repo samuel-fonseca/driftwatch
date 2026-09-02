@@ -8,8 +8,7 @@ differently across venues.
 The pipeline is roughly: **ingest → normalize → coalesce → dedupe → persist →
 detect divergence → stream**. Signals are fanned out over Server-Sent Events,
 with backpressure handled so a slow subscriber can't degrade ingest for anyone
-else. Everything outside of storage and metrics is built on the Go standard
-library.
+else.
 
 ## Getting started
 
