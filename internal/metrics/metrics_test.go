@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -210,10 +211,12 @@ func TestGatherAndLint(t *testing.T) {
 	}
 }
 
-// TestDuplicateRegistrationFails pins the behaviour that motivates passing
-// a Registerer through pipeline.Config: registering a second collector into
-// the same registry is an error, so building two pipelines in one process
-// panics if registration happens inside pipeline.New.
+// TestDuplicateRegistrationFails pins the behaviour that pipeline.Config's
+// Registry field exists to work around: a registry rejects a second
+// collector describing the same metrics, so pipeline.New -- which calls
+// MustRegister -- would panic on the second Pipeline in a process if it
+// always used the package-level Registry. Callers that need more than one
+// pass their own registry instead.
 func TestDuplicateRegistrationFails(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	if err := reg.Register(testCollector()); err != nil {
@@ -222,6 +225,64 @@ func TestDuplicateRegistrationFails(t *testing.T) {
 
 	if err := reg.Register(testCollector()); err == nil {
 		t.Error("second Register succeeded, want a duplicate-registration error")
+	}
+}
+
+// TestEveryStatsFieldIsExported is the guard wantMetricCount gestures at but
+// cannot enforce. Each fake carries a value unique across all four Stats
+// structs, so a field that Collect never sends is a value that never reaches
+// the registry -- which is exactly the silent failure of adding a field to a
+// Stats struct and forgetting the matching line in Collect.
+func TestEveryStatsFieldIsExported(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(testCollector()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	exported := map[float64]bool{}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			if c := metric.GetCounter(); c != nil {
+				exported[c.GetValue()] = true
+			}
+			if g := metric.GetGauge(); g != nil {
+				exported[g.GetValue()] = true
+			}
+		}
+	}
+
+	c := testCollector()
+	subsystems := map[string]any{
+		"buffer":     c.Buffer.Stats(),
+		"hub":        c.Hub.Stats(),
+		"dedupe":     c.Dedupe.Stats(),
+		"divergence": c.Divergence.Stats(),
+	}
+
+	seen := map[float64]string{}
+	for subsystem, stats := range subsystems {
+		v := reflect.ValueOf(stats)
+		for i := range v.NumField() {
+			field := v.Type().Field(i).Name
+			value := float64(v.Field(i).Int())
+
+			// The guard only works while the fixture values stay unique.
+			if prev, dup := seen[value]; dup {
+				t.Fatalf("fixture value %v is used by both %s and %s.%s; give every field a distinct value",
+					value, prev, subsystem, field)
+			}
+			seen[value] = subsystem + "." + field
+
+			if !exported[value] {
+				t.Errorf("%s.%s (value %v) reaches no metric -- Collect is missing a line for it",
+					subsystem, field, value)
+			}
+		}
 	}
 }
 

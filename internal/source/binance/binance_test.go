@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/samuel-fonseca/driftwatch/internal/quote"
+	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/source/poller"
+	"github.com/samuel-fonseca/driftwatch/internal/source/sourcetest"
 	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
@@ -18,18 +20,6 @@ import (
 const exchangeInfoBody = `{"symbols":[
 	{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true}
 ]}`
-
-func infoServer(t *testing.T, body string) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("request method = %q, want %q", r.Method, http.MethodGet)
-		}
-		w.Write([]byte(body))
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
 
 // testLoader mirrors how New binds tickerLoader: to a poller.HTTP and an
 // exchangeInfo URL, yielding the symbols.Loader the poller ultimately calls.
@@ -40,13 +30,12 @@ func testLoader(url string) symbols.Loader {
 	}
 }
 
-// --- parseTicks tests ---
+// --- parseTicks ---
 //
-// Note the format difference from Bitfinex throughout: Binance's numeric
-// fields are JSON STRINGS ("65432.10000000"), not JSON numbers, and the
-// payload is a homogeneous array of objects, not positional arrays -- so
-// there's no funding-row-shaped trap here, but there IS a string-parsing
-// failure mode Bitfinex's parseTicks never had to handle.
+// Binance's numeric fields are JSON STRINGS ("65432.10000000"), not JSON
+// numbers, and the payload is a homogeneous array of objects rather than
+// positional arrays. So there is no short-row trap here as there is for
+// Bitfinex, but there IS a string-parsing failure mode the others never had.
 //
 // parseTicks does not filter by symbol; the poller's table lookup drops
 // unlisted symbols, and those drops are covered in internal/source/poller.
@@ -79,10 +68,11 @@ func TestParseTicksReadsRow(t *testing.T) {
 	}
 }
 
-// Binance's numbers arriving as JSON strings means strconv.ParseFloat can fail
-// where a JSON number type assertion never could. "Skip, never guess": don't
-// panic, don't treat it as zero, drop the row.
-func TestParseTicksMalformedNumberSkipsRow(t *testing.T) {
+// Numbers arriving as JSON strings mean strconv.ParseFloat can fail where a
+// JSON number type assertion never could. Skip, never guess: don't panic,
+// don't treat it as zero, drop the row -- a half-read book would publish one
+// side of a quote the venue never sent.
+func TestParseTicksMalformedNumberSkipsWholeRow(t *testing.T) {
 	cases := []struct{ name, row string }{
 		{"bid price", `{"symbol":"BTCUSDT","bidPrice":"not-a-number","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"}`},
 		{"bid size", `{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"","askPrice":"65433.00","askQty":"2.1"}`},
@@ -96,10 +86,8 @@ func TestParseTicksMalformedNumberSkipsRow(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseTicks() = %v, want nil", err)
 			}
-			// The whole row goes, not just the bad side: a half-read book
-			// would publish one side of a quote the venue never sent.
 			if len(ticks) != 0 {
-				t.Errorf("len(ticks) = %d, want 0 (row is unreadable): %+v", len(ticks), ticks)
+				t.Errorf("len(ticks) = %d, want 0 (the row is unreadable): %+v", len(ticks), ticks)
 			}
 		})
 	}
@@ -135,7 +123,7 @@ func TestParseTicksEmptyArray(t *testing.T) {
 		t.Fatalf("parseTicks() = %v, want nil", err)
 	}
 	if len(ticks) != 0 {
-		t.Fatalf("expected 0 ticks for an empty array, got %+v", ticks)
+		t.Fatalf("len(ticks) = %d, want 0: %+v", len(ticks), ticks)
 	}
 }
 
@@ -145,7 +133,7 @@ func TestParseTicksMalformedJSONIsError(t *testing.T) {
 	}
 }
 
-// --- parseTickers tests ---
+// --- parseTickers ---
 
 func TestParseTickersBuildsInstruments(t *testing.T) {
 	body := `{"symbols":[
@@ -165,10 +153,44 @@ func TestParseTickersBuildsInstruments(t *testing.T) {
 	if got := table["BTCUSDT"]; got != want {
 		t.Errorf("table[\"BTCUSDT\"] = %+v, want %+v", got, want)
 	}
-	// The venue-native symbol is the key, and Market is the canonical pair --
-	// the whole point of the normalization.
+	// The venue-native symbol is the key and Market is the canonical pair --
+	// the whole point of the normalisation.
 	if got := table["ETHBTC"].Market; got != "ETH-BTC" {
 		t.Errorf("table[\"ETHBTC\"].Market = %q, want %q", got, "ETH-BTC")
+	}
+}
+
+// The rule is "TRADING *and* spot-tradable"; each case names the half it
+// exercises, so a rule that decayed into a single check still fails here.
+func TestParseTickersFiltersToTradableSpotSymbols(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		spot     bool
+		wantKept bool
+		why      string
+	}{
+		{"trading and spot", "TRADING", true, true, "the only combination we quote"},
+		{"halted but spot", "BREAK", true, false, "quoting it would publish prices for a market that is not trading"},
+		{"trading but not spot", "TRADING", false, false, "margin- or futures-only is not a spot market"},
+		{"halted and not spot", "BREAK", false, false, "neither half of the rule holds"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := fmt.Sprintf(
+				`{"symbols":[{"symbol":"XUSDT","status":%q,"baseAsset":"X","quoteAsset":"USDT","isSpotTradingAllowed":%t}]}`,
+				c.status, c.spot,
+			)
+
+			table, err := parseTickers([]byte(body))
+			if err != nil {
+				t.Fatalf("parseTickers() = %v, want nil", err)
+			}
+			if _, kept := table["XUSDT"]; kept != c.wantKept {
+				t.Errorf("kept = %v, want %v -- %s", kept, c.wantKept, c.why)
+			}
+		})
 	}
 }
 
@@ -191,6 +213,8 @@ func TestParseTickersMalformedJSONIsError(t *testing.T) {
 	}
 }
 
+// exchangeInfo carries far more than the five fields decoded here, and
+// Binance adds to it over time.
 func TestParseTickersIgnoresUnknownFields(t *testing.T) {
 	body := `{"timezone":"UTC","serverTime":1700000000000,"symbols":[
 		{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true,"filters":[{"filterType":"PRICE_FILTER"}]}
@@ -205,66 +229,10 @@ func TestParseTickersIgnoresUnknownFields(t *testing.T) {
 	}
 }
 
-// --- filter tests ---
-//
-// The intent is "list only symbols that are TRADING *and* spot-tradable".
-// Each case below names which half of that rule it exercises.
-
-func TestParseTickersKeepsTradingSpotSymbol(t *testing.T) {
-	body := `{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true}]}`
-
-	table, err := parseTickers([]byte(body))
-	if err != nil {
-		t.Fatalf("parseTickers() = %v, want nil", err)
-	}
-	if _, ok := table["BTCUSDT"]; !ok {
-		t.Error("BTCUSDT was filtered out, want it kept (TRADING and spot-allowed)")
-	}
-}
-
-func TestParseTickersDropsHaltedNonSpotSymbol(t *testing.T) {
-	body := `{"symbols":[{"symbol":"DEADUSDT","status":"BREAK","baseAsset":"DEAD","quoteAsset":"USDT","isSpotTradingAllowed":false}]}`
-
-	table, err := parseTickers([]byte(body))
-	if err != nil {
-		t.Fatalf("parseTickers() = %v, want nil", err)
-	}
-	if _, ok := table["DEADUSDT"]; ok {
-		t.Error("DEADUSDT was kept, want it dropped (neither TRADING nor spot-allowed)")
-	}
-}
-
-func TestParseTickersDropsHaltedSpotSymbol(t *testing.T) {
-	// Halted mid-session but still flagged spot-tradable: quoting it would
-	// publish prices for a market that isn't trading.
-	body := `{"symbols":[{"symbol":"HALTUSDT","status":"BREAK","baseAsset":"HALT","quoteAsset":"USDT","isSpotTradingAllowed":true}]}`
-
-	table, err := parseTickers([]byte(body))
-	if err != nil {
-		t.Fatalf("parseTickers() = %v, want nil", err)
-	}
-	if _, ok := table["HALTUSDT"]; ok {
-		t.Error("HALTUSDT (status BREAK) was kept, want it dropped -- status must be TRADING")
-	}
-}
-
-func TestParseTickersDropsTradingNonSpotSymbol(t *testing.T) {
-	// TRADING but margin/futures-only: not a spot market, so not ours.
-	body := `{"symbols":[{"symbol":"MARGINUSDT","status":"TRADING","baseAsset":"MARGIN","quoteAsset":"USDT","isSpotTradingAllowed":false}]}`
-
-	table, err := parseTickers([]byte(body))
-	if err != nil {
-		t.Fatalf("parseTickers() = %v, want nil", err)
-	}
-	if _, ok := table["MARGINUSDT"]; ok {
-		t.Error("MARGINUSDT (isSpotTradingAllowed false) was kept, want it dropped -- spot only")
-	}
-}
-
-// --- tickerLoader tests ---
+// --- tickerLoader ---
 
 func TestTickerLoaderReturnsTable(t *testing.T) {
-	server := infoServer(t, exchangeInfoBody)
+	server := sourcetest.Server(t, exchangeInfoBody)
 
 	table, err := testLoader(server.URL)(context.Background())
 	if err != nil {
@@ -275,29 +243,144 @@ func TestTickerLoaderReturnsTable(t *testing.T) {
 	}
 }
 
-func TestTickerLoaderNonOKStatusIsError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer server.Close()
+func TestTickerLoaderErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		serve func(t *testing.T) string
+		why   string
+	}{
+		{
+			name:  "rate limited",
+			serve: func(t *testing.T) string { return sourcetest.StatusServer(t, http.StatusTooManyRequests).URL },
+			why:   "a 429 must back the poller off, not empty the table",
+		},
+		{
+			name:  "server error",
+			serve: func(t *testing.T) string { return sourcetest.StatusServer(t, http.StatusInternalServerError).URL },
+			why:   "an outage must not look like a venue with no symbols",
+		},
+		{
+			name:  "unparseable body",
+			serve: func(t *testing.T) string { return sourcetest.Server(t, `not json at all`).URL },
+			why:   "a 200 of garbage is schema drift and must be reported",
+		},
+	}
 
-	if _, err := testLoader(server.URL)(context.Background()); err == nil {
-		t.Error("tickerLoader() = nil error for a 429, want an error")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := testLoader(c.serve(t))(context.Background()); err == nil {
+				t.Errorf("tickerLoader() = nil error, want one -- %s", c.why)
+			}
+		})
 	}
 }
 
-func TestTickerLoaderMalformedBodyIsError(t *testing.T) {
-	server := infoServer(t, `not json at all`)
+// --- adapter construction ---
 
-	if _, err := testLoader(server.URL)(context.Background()); err == nil {
-		t.Error("tickerLoader() = nil error for a non-JSON body, want an error")
+var _ source.Source = (*Adapter)(nil)
+
+func TestNewUsesVenueName(t *testing.T) {
+	if got := New(Config{}).Name(); got != venue {
+		t.Errorf("Name() = %q, want %q", got, venue)
+	}
+}
+
+func TestConfigWithDefaults(t *testing.T) {
+	got := Config{}.withDefaults()
+
+	if got.TickersURL != defaultTickersURL {
+		t.Errorf("TickersURL = %q, want %q", got.TickersURL, defaultTickersURL)
+	}
+	if got.ExchangeInfoURL != defaultExchangeInfoURL {
+		t.Errorf("ExchangeInfoURL = %q, want %q", got.ExchangeInfoURL, defaultExchangeInfoURL)
+	}
+	// The two URLs address different endpoints; wiring one into the other
+	// would leave the poller parsing tickers as exchangeInfo forever.
+	if got.TickersURL == got.ExchangeInfoURL {
+		t.Error("TickersURL and ExchangeInfoURL resolved to the same endpoint")
+	}
+	if got.Tuning.HTTPTimeout == 0 {
+		t.Error("Tuning was not defaulted")
+	}
+}
+
+func TestConfigWithDefaultsKeepsExplicitValues(t *testing.T) {
+	cfg := Config{
+		TickersURL:      "http://tickers.invalid",
+		ExchangeInfoURL: "http://info.invalid",
+		Tuning:          poller.Tuning{HTTPTimeout: time.Second},
+	}
+
+	got := cfg.withDefaults()
+	if got.TickersURL != cfg.TickersURL {
+		t.Errorf("TickersURL = %q, want the explicit %q", got.TickersURL, cfg.TickersURL)
+	}
+	if got.ExchangeInfoURL != cfg.ExchangeInfoURL {
+		t.Errorf("ExchangeInfoURL = %q, want the explicit %q", got.ExchangeInfoURL, cfg.ExchangeInfoURL)
+	}
+	if got.Tuning.HTTPTimeout != time.Second {
+		t.Errorf("Tuning.HTTPTimeout = %v, want the explicit 1s", got.Tuning.HTTPTimeout)
+	}
+}
+
+// --- adapter end to end ---
+
+// The one test that proves the whole venue adapter works: the loader closure
+// New builds is bound to the right URL, the symbol table it returns resolves
+// the ticker rows, and the poller turns them into canonical quotes. A
+// withDefaults test can only check the URLs are distinct strings -- this
+// checks they are wired to the endpoints that actually serve them.
+func TestAdapterRunProducesQuotes(t *testing.T) {
+	tickers := sourcetest.Server(t, `[{"symbol":"BTCUSDT","bidPrice":"65432.10","bidQty":"3.5","askPrice":"65433.00","askQty":"2.1"}]`)
+	info := sourcetest.Server(t, exchangeInfoBody)
+
+	adapter := New(Config{
+		TickersURL:      tickers.URL,
+		ExchangeInfoURL: info.URL,
+		Tuning: poller.Tuning{
+			PollInterval:   10 * time.Millisecond,
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			SymbolsRefresh: time.Hour,
+		},
+	})
+
+	if adapter.Name() != venue {
+		t.Errorf("Name() = %q, want %q", adapter.Name(), venue)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan quote.Quote, 16)
+	errCh := make(chan error, 1)
+	go func() { errCh <- adapter.Run(ctx, out) }()
+
+	select {
+	case q := <-out:
+		if q.Venue != venue {
+			t.Errorf("Venue = %q, want %q", q.Venue, venue)
+		}
+		if q.Market != "BTC-USDT" {
+			t.Errorf("Market = %q, want %q -- the symbol table did not resolve the ticker row", q.Market, "BTC-USDT")
+		}
+		if q.Selection != "bid" && q.Selection != "ask" {
+			t.Errorf("Selection = %q, want bid or ask", q.Selection)
+		}
+		if q.Price <= 0 {
+			t.Errorf("Price = %v, want a real price", q.Price)
+		}
+	case err := <-errCh:
+		t.Fatalf("Run returned %v before producing a quote", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no quote arrived from the adapter")
 	}
 }
 
 // --- registry integration ---
 
 func TestRegistryLoadsFromTickerLoader(t *testing.T) {
-	server := infoServer(t, exchangeInfoBody)
+	server := sourcetest.Server(t, exchangeInfoBody)
 
 	r := symbols.NewRegistry(testLoader(server.URL), time.Hour)
 	if err := r.Load(context.Background()); err != nil {

@@ -18,7 +18,10 @@ type Store struct {
 	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
+	closed bool
 }
+
+var ErrClosed = errors.New("ndjson: store is closed")
 
 func Open(path string) (*Store, error) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -35,6 +38,10 @@ func Open(path string) (*Store, error) {
 func (s *Store) WriteBatch(ctx context.Context, batch []quote.Quote) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrClosed
+	}
 
 	for _, q := range batch {
 		data, err := json.Marshal(q)
@@ -57,6 +64,11 @@ func (s *Store) WriteBatch(ctx context.Context, batch []quote.Quote) error {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil // already flushed and closed
+	}
+	s.closed = true
 
 	flushErr := s.writer.Flush()
 	closeErr := s.file.Close()

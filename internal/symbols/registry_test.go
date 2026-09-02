@@ -3,64 +3,93 @@ package symbols
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // --- test helpers ---
 
-// staticLoader returns a Loader serving a table with a single instrument
-// keyed by symbol, plus a counter of how many times it was invoked.
-func staticLoader(symbol string) (Loader, *int) {
-	calls := 0
-	return func(context.Context) (Table, error) {
-		calls++
-		return Table{symbol: {Symbol: symbol, Base: "BTC", Quote: "USDT", Market: "BTC-USDT"}}, nil
-	}, &calls
+// fakeLoader is the one loader stand-in these tests need: it counts calls,
+// reports each one on a channel so Run tests can wait on real progress
+// instead of sleeping, and serves a scripted sequence of errors. The last
+// error in the sequence repeats once the rest are exhausted.
+type fakeLoader struct {
+	table Table
+	errs  []error
+
+	calls atomic.Int32
+	ch    chan int
 }
 
-// signalLoader returns a Loader that reports each invocation on the returned
-// channel, letting Run tests wait on real progress instead of sleeping. The
-// results slice is consumed one entry per call; the last entry repeats once
-// exhausted.
-func signalLoader(results []error) (Loader, <-chan int) {
-	ch := make(chan int, 64)
-	call := 0
-	return func(context.Context) (Table, error) {
-		call++
-		err := results[min(call-1, len(results)-1)]
-		select {
-		case ch <- call:
-		default:
-		}
-		if err != nil {
+// newLoader serves a table containing symbol. With no errs it always
+// succeeds; otherwise errs[i] is returned on call i+1.
+func newLoader(symbol string, errs ...error) *fakeLoader {
+	return &fakeLoader{
+		table: Table{symbol: {Symbol: symbol, Base: "BTC", Quote: "USDT", Market: "BTC-USDT"}},
+		errs:  errs,
+		ch:    make(chan int, 64),
+	}
+}
+
+// Load satisfies Loader.
+func (f *fakeLoader) Load(context.Context) (Table, error) {
+	call := int(f.calls.Add(1))
+
+	select {
+	case f.ch <- call:
+	default:
+	}
+
+	if len(f.errs) > 0 {
+		if err := f.errs[min(call-1, len(f.errs)-1)]; err != nil {
 			return nil, err
 		}
-		return Table{"BTCUSDT": {Symbol: "BTCUSDT"}}, nil
-	}, ch
+	}
+	return f.table, nil
 }
 
 // waitForCall blocks until the loader reports call number n, or fails the test.
-func waitForCall(t *testing.T, ch <-chan int, n int) {
+func (f *fakeLoader) waitForCall(t *testing.T, n int) {
 	t.Helper()
+
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case got := <-ch:
+		case got := <-f.ch:
 			if got >= n {
 				return
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for loader call %d", n)
+			t.Fatalf("timed out waiting for loader call %d (saw %d)", n, f.calls.Load())
 		}
 	}
+}
+
+// start runs r.Run in the background and stops it with the test.
+func start(t *testing.T, r *Registry) <-chan error {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("Run did not return after cancellation")
+		}
+	})
+	return done
 }
 
 // --- Lookup tests ---
 
 func TestLookupBeforeLoadReturnsNotFound(t *testing.T) {
-	loader, _ := staticLoader("BTCUSDT")
-	r := NewRegistry(loader, time.Hour)
+	r := NewRegistry(newLoader("BTCUSDT").Load, time.Hour)
 
 	inst, ok := r.Lookup("BTCUSDT")
 	if ok {
@@ -72,8 +101,7 @@ func TestLookupBeforeLoadReturnsNotFound(t *testing.T) {
 }
 
 func TestLookupUnknownSymbolReturnsNotFound(t *testing.T) {
-	loader, _ := staticLoader("BTCUSDT")
-	r := NewRegistry(loader, time.Hour)
+	r := NewRegistry(newLoader("BTCUSDT").Load, time.Hour)
 	if err := r.Load(context.Background()); err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
@@ -86,14 +114,14 @@ func TestLookupUnknownSymbolReturnsNotFound(t *testing.T) {
 // --- Load tests ---
 
 func TestLoadPopulatesTable(t *testing.T) {
-	loader, calls := staticLoader("BTCUSDT")
-	r := NewRegistry(loader, time.Hour)
+	loader := newLoader("BTCUSDT")
+	r := NewRegistry(loader.Load, time.Hour)
 
 	if err := r.Load(context.Background()); err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
-	if *calls != 1 {
-		t.Errorf("loader called %d times, want 1", *calls)
+	if got := loader.calls.Load(); got != 1 {
+		t.Errorf("loader called %d times, want 1", got)
 	}
 
 	inst, ok := r.Lookup("BTCUSDT")
@@ -190,60 +218,43 @@ func TestLoadPassesContextToLoader(t *testing.T) {
 // binance.Adapter.Run does exactly that, and relies on a failed first Load
 // aborting startup rather than being swallowed by a background goroutine.
 func TestRunDoesNotLoadBeforeFirstTick(t *testing.T) {
-	loader, ch := signalLoader([]error{nil})
+	loader := newLoader("BTCUSDT")
 	// A refresh interval far longer than the test: any load that happens
 	// could only be a priming load.
-	r := NewRegistry(loader, time.Hour)
+	r := NewRegistry(loader.Load, time.Hour)
+	start(t, r)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- r.Run(ctx) }()
+	time.Sleep(100 * time.Millisecond)
 
-	select {
-	case n := <-ch:
-		t.Fatalf("loader ran (call %d) before the first tick, want no load until then", n)
-	case <-time.After(100 * time.Millisecond):
+	if got := loader.calls.Load(); got != 0 {
+		t.Errorf("loader ran %d times before the first tick, want 0", got)
 	}
-
 	if _, ok := r.Lookup("BTCUSDT"); ok {
 		t.Error("Lookup(\"BTCUSDT\") = true before any tick, want false")
-	}
-
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Errorf("Run() = %v, want %v", err, context.Canceled)
 	}
 }
 
 func TestRunRefreshesOnInterval(t *testing.T) {
-	loader, ch := signalLoader([]error{nil})
-	r := NewRegistry(loader, 5*time.Millisecond)
+	loader := newLoader("BTCUSDT")
+	r := NewRegistry(loader.Load, 5*time.Millisecond)
+	start(t, r)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- r.Run(ctx) }()
+	// Run does not prime, so every one of these came from a tick.
+	loader.waitForCall(t, 3)
 
-	// Call 1 is the priming load; 2 and 3 can only come from ticks.
-	waitForCall(t, ch, 3)
-
-	cancel()
-	<-done
+	if _, ok := r.Lookup("BTCUSDT"); !ok {
+		t.Error("Lookup(\"BTCUSDT\") = false after a refresh, want true")
+	}
 }
 
 func TestRunSurvivesRefreshFailure(t *testing.T) {
 	// Succeed, then fail, then succeed: a mid-stream refresh error must be
 	// logged and swallowed, not returned.
-	loader, ch := signalLoader([]error{nil, errors.New("transient"), nil})
-	r := NewRegistry(loader, 5*time.Millisecond)
+	loader := newLoader("BTCUSDT", nil, errors.New("transient"), nil)
+	r := NewRegistry(loader.Load, 5*time.Millisecond)
+	done := start(t, r)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- r.Run(ctx) }()
-
-	waitForCall(t, ch, 3)
+	loader.waitForCall(t, 3)
 	select {
 	case err := <-done:
 		t.Fatalf("Run() returned %v after a failed refresh, want it to keep running", err)
@@ -254,16 +265,10 @@ func TestRunSurvivesRefreshFailure(t *testing.T) {
 	if _, ok := r.Lookup("BTCUSDT"); !ok {
 		t.Error("Lookup(\"BTCUSDT\") = false, want true")
 	}
-
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Errorf("Run() = %v, want %v", err, context.Canceled)
-	}
 }
 
 func TestRunReturnsWhenContextAlreadyCancelled(t *testing.T) {
-	loader, _ := staticLoader("BTCUSDT")
-	r := NewRegistry(loader, time.Hour)
+	r := NewRegistry(newLoader("BTCUSDT").Load, time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -277,28 +282,18 @@ func TestRunReturnsWhenContextAlreadyCancelled(t *testing.T) {
 // TestLookupDuringRefreshIsRaceFree is meaningful under `go test -race`: it
 // hammers Lookup while Run swaps the table underneath it.
 func TestLookupDuringRefreshIsRaceFree(t *testing.T) {
-	loader, ch := signalLoader([]error{nil})
-	r := NewRegistry(loader, time.Millisecond)
+	loader := newLoader("BTCUSDT")
+	r := NewRegistry(loader.Load, time.Millisecond)
+	start(t, r)
+	loader.waitForCall(t, 1)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- r.Run(ctx) }()
-	waitForCall(t, ch, 1)
-
-	readers := make(chan struct{}, 4)
+	var readers sync.WaitGroup
 	for range 4 {
-		go func() {
+		readers.Go(func() {
 			for range 500 {
 				r.Lookup("BTCUSDT")
 			}
-			readers <- struct{}{}
-		}()
+		})
 	}
-	for range 4 {
-		<-readers
-	}
-
-	cancel()
-	<-done
+	readers.Wait()
 }
