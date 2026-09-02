@@ -17,14 +17,17 @@ type Quote struct {
 	ReceivedAt time.Time `json:"received_at"`
 }
 
+// Keys the quote with the venue + market + selection
 func (q Quote) Key() string {
 	return fmt.Sprintf("%s|%s|%s", q.Venue, q.Market, q.Selection)
 }
 
+// market key with a combination of market + selection
 func (q Quote) MarketKey() string {
 	return fmt.Sprintf("%s|%s", q.Market, q.Selection)
 }
 
+// A unique fingerprint of the quote based on price+size
 func (q Quote) Fingerprint() uint64 {
 	h := fnv.New64()
 	h.Write([]byte(fmt.Appendf(
