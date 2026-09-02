@@ -44,6 +44,7 @@ type Poller struct {
 }
 
 func New(cfg Config) *Poller {
+	cfg.Tuning = cfg.Tuning.WithDefaults()
 	return &Poller{
 		cfg:      cfg,
 		registry: symbols.NewRegistry(cfg.Loader, cfg.Tuning.SymbolsRefresh),
