@@ -151,6 +151,31 @@ var (
 		"Total divergence suppressed because of stale events",
 		nil, nil,
 	)
+	divergenceCollisionDesc = prometheus.NewDesc(
+		"driftwatch_divergence_suppressed_collision_total",
+		"Total divergence suppressed because prices disagree too far to be one asset",
+		nil, nil,
+	)
+	divergenceMarketsCollidedDesc = prometheus.NewDesc(
+		"driftwatch_divergence_markets_collided",
+		"Markets that have tripped the collision ratio",
+		nil, nil,
+	)
+	divergenceMarketsTrackedDesc = prometheus.NewDesc(
+		"driftwatch_divergence_markets_tracked",
+		"Markets the detector currently holds quotes for",
+		nil, nil,
+	)
+	divergenceMarketsCrossableDesc = prometheus.NewDesc(
+		"driftwatch_divergence_markets_crossable",
+		"Markets with a live bid and a live ask on different venues",
+		nil, nil,
+	)
+	divergenceStaleArrivalDesc = prometheus.NewDesc(
+		"driftwatch_divergence_suppressed_stale_arrival_total",
+		"Total divergence suppressed because of out of order arrival events",
+		nil, nil,
+	)
 )
 
 func (c PipelineCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -194,6 +219,11 @@ func (c PipelineCollector) Collect(ch chan<- prometheus.Metric) {
 	counter(ch, divergenceSameVenueDesc, uint64(divergence.SuppressedSameVenue))
 	counter(ch, divergenceBelowThresholdDesc, uint64(divergence.SuppressedBelowThreshold))
 	counter(ch, divergenceStaleDesc, uint64(divergence.SuppressedStale))
+	counter(ch, divergenceStaleArrivalDesc, uint64(divergence.SuppressedStaleArrival))
+	gauge(ch, divergenceMarketsTrackedDesc, int(divergence.MarketsTracked))
+	gauge(ch, divergenceMarketsCrossableDesc, int(divergence.MarketsCrossable))
+	counter(ch, divergenceCollisionDesc, uint64(divergence.SuppressedCollision))
+	gauge(ch, divergenceMarketsCollidedDesc, int(divergence.MarketsCollided))
 }
 
 func counter(ch chan<- prometheus.Metric, desc *prometheus.Desc, value uint64) {

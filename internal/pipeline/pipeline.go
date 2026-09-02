@@ -26,10 +26,12 @@ type Config struct {
 	BufferCapacity   int
 	DedupeCapacity   int
 	EdgeThresholdBps float64
+	CollisionRatio   float64
 	StaleThreshold   time.Duration
-	NumWorkers       int
-	BatchSize        int
-	RawChannelSize   int
+
+	NumWorkers     int
+	BatchSize      int
+	RawChannelSize int
 }
 
 type Pipeline struct {
@@ -43,6 +45,7 @@ func (c *Config) ApplyDefaults() {
 	c.BufferCapacity = cmp.Or(c.BufferCapacity, 16384)
 	c.DedupeCapacity = cmp.Or(c.DedupeCapacity, 16384)
 	c.EdgeThresholdBps = cmp.Or(c.EdgeThresholdBps, 5)
+	c.CollisionRatio = cmp.Or(c.CollisionRatio, 4)
 	c.StaleThreshold = cmp.Or(c.StaleThreshold, 30*time.Second)
 	c.NumWorkers = cmp.Or(c.NumWorkers, 4)
 	c.BatchSize = cmp.Or(c.BatchSize, 256)
@@ -56,7 +59,11 @@ func New(cfg Config) *Pipeline {
 		cfg:   cfg,
 		buf:   buffer.New(cfg.BufferCapacity),
 		dedup: dedupe.New(cfg.DedupeCapacity),
-		div:   divergence.New(cfg.EdgeThresholdBps, cfg.StaleThreshold),
+		div: divergence.New(
+			cfg.EdgeThresholdBps,
+			cfg.StaleThreshold,
+			cfg.CollisionRatio,
+		),
 	}
 	metrics.Registry.MustRegister(metrics.PipelineCollector{
 		Buffer:     p.buf,
@@ -69,14 +76,16 @@ func New(cfg Config) *Pipeline {
 }
 
 type Stats struct {
-	Buffer buffer.Stats `json:"buffer"`
-	Hub    hub.Stats    `json:"hub"`
+	Buffer          buffer.Stats `json:"buffer"`
+	Hub             hub.Stats    `json:"hub"`
+	CollidedMarkets []string     `json:"collided_markets"`
 }
 
 func (p *Pipeline) Stats() Stats {
 	return Stats{
-		Buffer: p.buf.Stats(),
-		Hub:    p.cfg.Hub.Stats(),
+		Buffer:          p.buf.Stats(),
+		Hub:             p.cfg.Hub.Stats(),
+		CollidedMarkets: p.div.Collided(),
 	}
 }
 
@@ -86,19 +95,15 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	for _, src := range p.cfg.Sources {
-		wg.Add(1)
-		go func(src source.Source) {
-			defer wg.Done()
+		wg.Go(func() {
 			err := src.Run(ctx, raw)
 			if err != nil {
 				log.Printf("failed to run source %s: %v", src.Name(), err)
 			}
-		}(src)
+		})
 	}
 
-	wg.Add(1)
 	wg.Go(func() {
-		defer wg.Done()
 		for {
 			select {
 			case q := <-raw:
@@ -110,11 +115,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	})
 
 	for range p.cfg.NumWorkers {
-		wg.Add(1)
-		wg.Go(func() {
-			defer wg.Done()
-			p.worker(ctx)
-		})
+		wg.Go(func() { p.worker(ctx) })
 	}
 
 	return nil
@@ -126,6 +127,8 @@ func (p *Pipeline) worker(ctx context.Context) {
 		if err != nil {
 			return
 		}
+
+		p.div.MarkAlive(batch)
 
 		survivors := p.dedup.FilterChanged(batch)
 		if len(survivors) == 0 {

@@ -69,6 +69,11 @@ func testCollector() PipelineCollector {
 			SuppressedSameVenue:        36,
 			SuppressedBelowThreshold:   37,
 			SuppressedStale:            38,
+			SuppressedStaleArrival:     39,
+			MarketsTracked:             40,
+			MarketsCrossable:           41,
+			SuppressedCollision:        42,
+			MarketsCollided:            43,
 		}},
 	}
 }
@@ -116,12 +121,24 @@ driftwatch_dedupe_size 24
 # HELP driftwatch_divergence_emitted_total Total divergence emitted events
 # TYPE driftwatch_divergence_emitted_total counter
 driftwatch_divergence_emitted_total 32
+# HELP driftwatch_divergence_markets_collided Markets that have tripped the collision ratio
+# TYPE driftwatch_divergence_markets_collided gauge
+driftwatch_divergence_markets_collided 43
+# HELP driftwatch_divergence_markets_crossable Markets with a live bid and a live ask on different venues
+# TYPE driftwatch_divergence_markets_crossable gauge
+driftwatch_divergence_markets_crossable 41
+# HELP driftwatch_divergence_markets_tracked Markets the detector currently holds quotes for
+# TYPE driftwatch_divergence_markets_tracked gauge
+driftwatch_divergence_markets_tracked 40
 # HELP driftwatch_divergence_observed_total Total divergence observed events
 # TYPE driftwatch_divergence_observed_total counter
 driftwatch_divergence_observed_total 31
 # HELP driftwatch_divergence_suppressed_below_threshold_total Total divergence suppressed because of below threshold events
 # TYPE driftwatch_divergence_suppressed_below_threshold_total counter
 driftwatch_divergence_suppressed_below_threshold_total 37
+# HELP driftwatch_divergence_suppressed_collision_total Total divergence suppressed because prices disagree too far to be one asset
+# TYPE driftwatch_divergence_suppressed_collision_total counter
+driftwatch_divergence_suppressed_collision_total 42
 # HELP driftwatch_divergence_suppressed_incomplete_book_total Total divergence suppressed because of incomplete book events
 # TYPE driftwatch_divergence_suppressed_incomplete_book_total counter
 driftwatch_divergence_suppressed_incomplete_book_total 34
@@ -134,6 +151,9 @@ driftwatch_divergence_suppressed_not_crossed_total 35
 # HELP driftwatch_divergence_suppressed_same_venue_total Total divergence suppressed because of same venue events
 # TYPE driftwatch_divergence_suppressed_same_venue_total counter
 driftwatch_divergence_suppressed_same_venue_total 36
+# HELP driftwatch_divergence_suppressed_stale_arrival_total Total divergence suppressed because of out of order arrival events
+# TYPE driftwatch_divergence_suppressed_stale_arrival_total counter
+driftwatch_divergence_suppressed_stale_arrival_total 39
 # HELP driftwatch_divergence_suppressed_stale_total Total divergence suppressed because of stale events
 # TYPE driftwatch_divergence_suppressed_stale_total counter
 driftwatch_divergence_suppressed_stale_total 38
@@ -152,8 +172,8 @@ driftwatch_hub_subscribers 11
 `
 
 // wantMetricCount is every metric the collector emits: 7 buffer + 4 hub +
-// 5 dedupe + 8 divergence.
-const wantMetricCount = 24
+// 5 dedupe + 13 divergence.
+const wantMetricCount = 29
 
 func TestCollectorExposition(t *testing.T) {
 	err := testutil.CollectAndCompare(testCollector(), strings.NewReader(wantExposition))
