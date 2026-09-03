@@ -3,12 +3,14 @@ package kraken
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/samuel-fonseca/driftwatch/internal/quote"
+	"github.com/samuel-fonseca/driftwatch/internal/source"
 	"github.com/samuel-fonseca/driftwatch/internal/source/poller"
+	"github.com/samuel-fonseca/driftwatch/internal/source/sourcetest"
 	"github.com/samuel-fonseca/driftwatch/internal/symbols"
 )
 
@@ -24,17 +26,7 @@ const assetPairsBody = `{"error":[],"result":{
 	"0GEUR":{"altname":"0GEUR","wsname":"0G/EUR","aclass_base":"currency","base":"0G","aclass_quote":"currency","quote":"ZEUR","lot":"unit5","cost_decimals":5,"pair_decimals":3,"lot_decimals":5,"lot_multiplier":1,"fees":[[0,0.4]],"fees_maker":[[0,0.23]],"fee_volume_currency":"ZUSD","margin_call":80,"margin_stop":40,"ordermin":"35","costmin":"0.45","tick_size":"0.001","status":"online","execution_venue":"international"}
 }}`
 
-func testServer(t *testing.T, body string) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("request method = %q, want %q", r.Method, http.MethodGet)
-		}
-		w.Write([]byte(body))
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
+func testHTTP() *poller.HTTP { return poller.NewHTTP(venue, 10*time.Second) }
 
 // tickBySymbol finds a tick in a parseTicks result. parseTicks ranges over a
 // map, so the output order is not deterministic and indexing is not safe.
@@ -47,7 +39,7 @@ func tickBySymbol(ticks []poller.Tick, symbol string) (poller.Tick, bool) {
 	return poller.Tick{}, false
 }
 
-// --- parseTicks tests ---
+// --- parseTicks ---
 //
 // Kraken's ticker fields are positional arrays of strings: a/b are
 // [price, wholeLotVolume, lotVolume], so the size lives at index 2, not 1.
@@ -55,83 +47,95 @@ func tickBySymbol(ticks []poller.Tick, symbol string) (poller.Tick, bool) {
 // anything unlisted, and those drops are covered in internal/source/poller.
 
 func TestParseTicks(t *testing.T) {
-	serverResponse := []byte(`{"error":[],"result":{"0GEUR":{"a":["0.1390000","10456","10456.000"],"b":["0.1380000","1272","1272.000"],"c":["0.1380000","241.10222"],"v":["47716.79697","120414.57487"],"p":["0.1426522","0.1400757"],"t":[169,308],"l":["0.1380000","0.1310000"],"h":["0.1460000","0.1460000"],"o":"0.1430000"},"0GUSD":{"a":["0.1600000","11903","11903.000"],"b":["0.1590000","41019","41019.000"],"c":["0.1610000","158.73739"],"v":["338511.71862","774760.84622"],"p":["0.1657123","0.1623335"],"t":[506,889],"l":["0.1600000","0.1520000"],"h":["0.1710000","0.1710000"],"o":"0.1650000"},"1INCHEUR":{"a":["0.07560","4253","4253.000"],"b":["0.07550","4221","4221.000"],"c":["0.07560","27.59844000"],"v":["11667.76213764","58536.96665133"],"p":["0.07594","0.07576"],"t":[7,36],"l":["0.07550","0.07400"],"h":["0.07630","0.07780"],"o":"0.07630"}}}`)
+	body := []byte(`{"error":[],"result":{"0GEUR":{"a":["0.1390000","10456","10456.000"],"b":["0.1380000","1272","1272.000"],"c":["0.1380000","241.10222"],"v":["47716.79697","120414.57487"],"p":["0.1426522","0.1400757"],"t":[169,308],"l":["0.1380000","0.1310000"],"h":["0.1460000","0.1460000"],"o":"0.1430000"},"0GUSD":{"a":["0.1600000","11903","11903.000"],"b":["0.1590000","41019","41019.000"],"c":["0.1610000","158.73739"],"v":["338511.71862","774760.84622"],"p":["0.1657123","0.1623335"],"t":[506,889],"l":["0.1600000","0.1520000"],"h":["0.1710000","0.1710000"],"o":"0.1650000"},"1INCHEUR":{"a":["0.07560","4253","4253.000"],"b":["0.07550","4221","4221.000"],"c":["0.07560","27.59844000"],"v":["11667.76213764","58536.96665133"],"p":["0.07594","0.07576"],"t":[7,36],"l":["0.07550","0.07400"],"h":["0.07630","0.07780"],"o":"0.07630"}}}`)
 
-	ticks, err := parseTicks(serverResponse)
+	ticks, err := parseTicks(body)
 	if err != nil {
-		t.Fatalf("parseTicks: unexpected error %v", err)
+		t.Fatalf("parseTicks() = %v, want nil", err)
 	}
 	if len(ticks) != 3 {
-		t.Fatalf("parseTicks: not enough ticks in response: got %d, want 3", len(ticks))
+		t.Fatalf("len(ticks) = %d, want 3", len(ticks))
 	}
 
-	// Assert the values, not just the count: the fields are read by position,
-	// so a reordering upstream would still yield three well-formed ticks.
+	// Assert the values, not just the count: the fields are read by
+	// position, so a reordering upstream would still yield three
+	// well-formed ticks carrying the wrong numbers.
 	got, ok := tickBySymbol(ticks, "0GEUR")
 	if !ok {
-		t.Fatalf("parseTicks: 0GEUR missing from %+v", ticks)
+		t.Fatalf("0GEUR missing from %+v", ticks)
 	}
 	if got.BidPrice != 0.1380000 || got.BidSize != 1272.000 {
-		t.Errorf("bid = %v @ %v, want 0.138 @ 1272", got.BidPrice, got.BidSize)
+		t.Errorf("bid = %v @ %v, want 0.138 @ 1272 (size is index 2, not 1)", got.BidPrice, got.BidSize)
 	}
 	if got.AskPrice != 0.1390000 || got.AskSize != 10456.000 {
 		t.Errorf("ask = %v @ %v, want 0.139 @ 10456", got.AskPrice, got.AskSize)
 	}
-	// Kraken sends no per-pair timestamp, so the poller substitutes its fetch
-	// time -- see the ObservedAt fallback in internal/source/poller.
+	// Kraken sends no per-pair timestamp, so the poller substitutes its
+	// fetch time -- see the ObservedAt fallback in internal/source/poller.
 	if !got.ObservedAt.IsZero() {
 		t.Errorf("ObservedAt = %v, want the zero value", got.ObservedAt)
 	}
 }
 
-func TestParseTicksHandlesErrorsInResponse(t *testing.T) {
-	serverResponse := []byte(`{"error":["foo","bar"],"result":{}}`)
-	ticks, err := parseTicks(serverResponse)
+func TestParseTicksSkipsUnreadableEntries(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string // the one symbol expected to survive
+		why  string
+	}{
+		{
+			name: "non-numeric fields",
+			body: `{"error":[],"result":{"0GEUR":{"a":["non-float","10456","10456.000"],"b":["0.1380000","1272","1272.000"]},"0GUSD":{"a":["0.1600000","11903","non-float"],"b":["0.1590000","41019","41019.000"]},"1INCHEUR":{"a":["0.07560","4253","4253.000"],"b":["0.07550","4221","4221.000"]},"AAVEETH":{"a":["0.05057","16","16.000"],"b":["0.05007","19","non-float"]}}}`,
+			want: "1INCHEUR",
+			why:  "a field that will not parse makes the whole entry unusable",
+		},
+		{
+			name: "short arrays",
+			body: `{"error":[],"result":{"0GEUR":{"a":["0.139","10456"],"b":["0.138","1272","1272.000"]},"0GUSD":{"a":["0.160","11903","11903.000"],"b":[]},"1INCHEUR":{"a":["0.0756","4253","4253.000"],"b":["0.0755","4221","4221.000"]}}}`,
+			want: "1INCHEUR",
+			why:  "a short array cannot be read positionally; indexing it would panic",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ticks, err := parseTicks([]byte(c.body))
+			if err != nil {
+				t.Fatalf("parseTicks() = %v, want nil", err)
+			}
+			if len(ticks) != 1 {
+				t.Fatalf("len(ticks) = %d, want 1 -- %s: %+v", len(ticks), c.why, ticks)
+			}
+			if ticks[0].Symbol != c.want {
+				t.Errorf("survivor = %q, want %q", ticks[0].Symbol, c.want)
+			}
+		})
+	}
+}
+
+// Kraken reports application errors in a 200 body, so the error array is the
+// only signal that the result is not usable.
+func TestParseTicksReportsVenueErrors(t *testing.T) {
+	ticks, err := parseTicks([]byte(`{"error":["foo","bar"],"result":{}}`))
 	if err == nil {
-		t.Fatalf("parseTicks: expected error, got nil")
+		t.Fatal("parseTicks() = nil error, want one")
 	}
 	if err.Error() != "Kraken returned: [foo bar]" {
-		t.Errorf("parseTicks: got \"%v\", want \"Kraken returned: [foo bar]\"", err)
+		t.Errorf("error = %q, want %q", err, "Kraken returned: [foo bar]")
 	}
 	if len(ticks) != 0 {
-		t.Errorf("parseTicks: got %d, want 0", len(ticks))
-	}
-}
-
-func TestParseTicksSkipsBadFloatFields(t *testing.T) {
-	serverResponse := []byte(`{"error":[],"result":{"0GEUR":{"a":["non-float","10456","10456.000"],"b":["0.1380000","1272","1272.000"]},"0GUSD":{"a":["0.1600000","11903","non-float"],"b":["0.1590000","41019","41019.000"]},"1INCHEUR":{"a":["0.07560","4253","4253.000"],"b":["non-float","4221","4221.000"]},"AAVEETH":{"a":["0.05057","16","16.000"],"b":["0.05007","19","non-float"]},"AAVEUSD":{"a":["122.60000","non-float","1.000"],"b":["122.54000","non-float","11.000"]}}}`)
-	ticks, err := parseTicks(serverResponse)
-	if err != nil {
-		t.Fatalf("parseTicks: unexpected error %v", err)
-	}
-	if len(ticks) != 1 {
-		t.Errorf("parseTicks: too many ticks in response: got %d, want 1", len(ticks))
-	}
-}
-
-// A short array cannot be read positionally at all -- indexing it would panic,
-// and guessing at the missing field would invent a price.
-func TestParseTicksSkipsShortArrays(t *testing.T) {
-	serverResponse := []byte(`{"error":[],"result":{"0GEUR":{"a":["0.139","10456"],"b":["0.138","1272","1272.000"]},"0GUSD":{"a":["0.160","11903","11903.000"],"b":[]},"1INCHEUR":{"a":["0.0756","4253","4253.000"],"b":["0.0755","4221","4221.000"]}}}`)
-	ticks, err := parseTicks(serverResponse)
-	if err != nil {
-		t.Fatalf("parseTicks: unexpected error %v", err)
-	}
-	if len(ticks) != 1 {
-		t.Fatalf("parseTicks: got %d ticks, want 1: %+v", len(ticks), ticks)
-	}
-	if ticks[0].Symbol != "1INCHEUR" {
-		t.Errorf("survivor = %q, want %q", ticks[0].Symbol, "1INCHEUR")
+		t.Errorf("len(ticks) = %d, want 0", len(ticks))
 	}
 }
 
 func TestParseTicksMalformedJSONIsError(t *testing.T) {
 	if _, err := parseTicks([]byte(`not json at all`)); err == nil {
-		t.Error("parseTicks: expected an error for a non-JSON body, got nil")
+		t.Error("parseTicks() = nil error for a non-JSON body, want an error")
 	}
 }
 
-// --- buildTable tests ---
+// --- buildTable ---
 
 // The assertion this whole package exists for. Kraken calls Bitcoin XBT; if
 // that is not canonicalised to BTC, every Kraken market becomes an island --
@@ -140,7 +144,7 @@ func TestParseTicksMalformedJSONIsError(t *testing.T) {
 func TestBuildTableCanonicalisesXBTToBTC(t *testing.T) {
 	table, err := buildTable([]byte(assetPairsBody))
 	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
+		t.Fatalf("buildTable() = %v, want nil", err)
 	}
 
 	inst, ok := table["XXBTZUSD"]
@@ -161,26 +165,23 @@ func TestBuildTableCanonicalisesXBTToBTC(t *testing.T) {
 func TestBuildTableKeysOnTheAssetPairsKey(t *testing.T) {
 	table, err := buildTable([]byte(assetPairsBody))
 	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
+		t.Fatalf("buildTable() = %v, want nil", err)
 	}
 
-	if _, ok := table["XXBTZUSD"]; !ok {
-		t.Errorf("table missing key %q: %+v", "XXBTZUSD", table)
+	if inst := table["XXBTZUSD"]; inst.Symbol != "XXBTZUSD" {
+		t.Errorf("Symbol = %q, want %q", inst.Symbol, "XXBTZUSD")
 	}
 	for _, wrong := range []string{"XBTUSD", "XBT/USD", "XBT-USD"} {
 		if _, ok := table[wrong]; ok {
 			t.Errorf("table has key %q; ticker symbols will never match it", wrong)
 		}
 	}
-	if inst := table["XXBTZUSD"]; inst.Symbol != "XXBTZUSD" {
-		t.Errorf("Symbol = %q, want %q", inst.Symbol, "XXBTZUSD")
-	}
 }
 
 func TestBuildTableBuildsEveryOnlinePair(t *testing.T) {
 	table, err := buildTable([]byte(assetPairsBody))
 	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
+		t.Fatalf("buildTable() = %v, want nil", err)
 	}
 	if len(table) != 3 {
 		t.Fatalf("len(table) = %d, want 3: %+v", len(table), table)
@@ -210,7 +211,7 @@ func TestBuildTableBuildsEveryOnlinePair(t *testing.T) {
 func TestBuildTableHasNoMarketCollisions(t *testing.T) {
 	table, err := buildTable([]byte(assetPairsBody))
 	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
+		t.Fatalf("buildTable() = %v, want nil", err)
 	}
 
 	seen := make(map[string]string, len(table))
@@ -222,149 +223,273 @@ func TestBuildTableHasNoMarketCollisions(t *testing.T) {
 	}
 }
 
-func TestBuildTableHandlesErrorsInResponse(t *testing.T) {
-	table, err := buildTable([]byte(`{"error":["foo","bar"],"result":{}}`))
-	if err == nil {
-		t.Fatalf("buildTable: expected error, got nil")
+func TestBuildTableSkipsUnusablePairs(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		why  string
+	}{
+		{
+			name: "not online",
+			body: `{"error":[],"result":{
+				"XXBTZUSD":{"wsname":"XBT/USD","status":"online"},
+				"XETHZUSD":{"wsname":"ETH/USD","status":"cancel_only"}
+			}}`,
+			why: "a halted or cancel-only pair is not quotable",
+		},
+		{
+			name: "unusable wsname",
+			body: `{"error":[],"result":{
+				"XXBTZUSD":{"wsname":"XBT/USD","status":"online"},
+				"NOSLASH":{"wsname":"XBTUSD","status":"online"},
+				"NOBASE":{"wsname":"/USD","status":"online"},
+				"NOQUOTE":{"wsname":"XBT/","status":"online"},
+				"EMPTY":{"wsname":"","status":"online"}
+			}}`,
+			why: "wsname is the only source of base/quote, so a bad one is unreadable",
+		},
 	}
-	if err.Error() != "Kraken returned: [foo bar]" {
-		t.Errorf("buildTable: got %q, want %q", err, "Kraken returned: [foo bar]")
-	}
-	if table != nil {
-		t.Errorf("buildTable: got %+v, want a nil table", table)
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			table, err := buildTable([]byte(c.body))
+			if err != nil {
+				t.Fatalf("buildTable() = %v, want nil", err)
+			}
+			if len(table) != 1 {
+				t.Fatalf("len(table) = %d, want 1 -- %s: %+v", len(table), c.why, table)
+			}
+			for _, inst := range table {
+				if strings.HasPrefix(inst.Market, "-") || strings.HasSuffix(inst.Market, "-") {
+					t.Errorf("built a half-empty market %q", inst.Market)
+				}
+			}
+		})
 	}
 }
 
-// A pair that is halted or cancel-only is not quotable; publishing prices for
-// it would report a market that is not trading.
-func TestBuildTableSkipsNonOnlineStatus(t *testing.T) {
-	body := `{"error":[],"result":{
-		"XXBTZUSD":{"wsname":"XBT/USD","base":"XXBT","quote":"ZUSD","status":"online"},
-		"XETHZUSD":{"wsname":"ETH/USD","base":"XETH","quote":"ZUSD","status":"cancel_only"}
-	}}`
+// The silent-death cases. Without these guards the registry installs an empty
+// table, every lookup misses, and Kraken publishes nothing forever without a
+// single error or backoff to show for it.
+func TestBuildTableEmptyOutcomeIsError(t *testing.T) {
+	cases := []struct {
+		name, body, wantIn string
+	}{
+		{
+			name:   "venue reported an error",
+			body:   `{"error":["foo","bar"],"result":{}}`,
+			wantIn: "Kraken returned: [foo bar]",
+		},
+		{
+			name: "no pairs at all",
+			body: `{"error":[],"result":{}}`,
+		},
+		{
+			// The realistic schema-drift case: status still parses, but
+			// wsname has been renamed or reformatted, so every pair is
+			// skipped and the table comes out empty.
+			name: "every pair dropped",
+			body: `{"error":[],"result":{
+				"XXBTZUSD":{"wsname":"XBTUSD","status":"online"},
+				"XETHZUSD":{"wsname":"ETHUSD","status":"online"}
+			}}`,
+			wantIn: "2",
+		},
+		{
+			name: "not JSON",
+			body: `not json at all`,
+		},
+	}
 
-	table, err := buildTable([]byte(body))
-	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
-	}
-	if len(table) != 1 {
-		t.Fatalf("len(table) = %d, want 1 (the cancel_only pair dropped): %+v", len(table), table)
-	}
-	if _, ok := table["XETHZUSD"]; ok {
-		t.Error("the cancel_only pair survived, want it dropped")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			table, err := buildTable([]byte(c.body))
+			if err == nil {
+				t.Fatalf("buildTable() = nil error, want one (table was %+v)", table)
+			}
+			if table != nil {
+				t.Errorf("buildTable() returned %+v alongside an error, want a nil table", table)
+			}
+			if c.wantIn != "" && !strings.Contains(err.Error(), c.wantIn) {
+				t.Errorf("error %q does not mention %q", err, c.wantIn)
+			}
+		})
 	}
 }
 
-// wsname is the only source of base/quote now, so a row without a usable one
-// is unreadable rather than partially readable.
-func TestBuildTableSkipsUnusableWsName(t *testing.T) {
-	body := `{"error":[],"result":{
-		"XXBTZUSD":{"wsname":"XBT/USD","status":"online"},
-		"NOSLASH":{"wsname":"XBTUSD","status":"online"},
-		"NOBASE":{"wsname":"/USD","status":"online"},
-		"NOQUOTE":{"wsname":"XBT/","status":"online"},
-		"EMPTY":{"wsname":"","status":"online"}
-	}}`
+// --- tickerLoader ---
 
-	table, err := buildTable([]byte(body))
-	if err != nil {
-		t.Fatalf("buildTable: unexpected error %v", err)
-	}
-	if len(table) != 1 {
-		t.Fatalf("len(table) = %d, want 1 (four unusable wsnames dropped): %+v", len(table), table)
-	}
-	for _, inst := range table {
-		if strings.HasPrefix(inst.Market, "-") || strings.HasSuffix(inst.Market, "-") {
-			t.Errorf("built a half-empty market %q", inst.Market)
-		}
-	}
+// tickerLoader must stay usable as the symbols.Loader the poller calls; this
+// is what makes the closure in New compile.
+var _ symbols.Loader = func(ctx context.Context) (symbols.Table, error) {
+	return tickerLoader(ctx, testHTTP(), defaultAssetPairsURL)
 }
-
-// A 200 with an empty result is the silent-death case: without this guard the
-// registry installs an empty table, every lookup misses, and Kraken publishes
-// nothing forever without a single error or backoff.
-func TestBuildTableEmptyResultIsError(t *testing.T) {
-	if _, err := buildTable([]byte(`{"error":[],"result":{}}`)); err == nil {
-		t.Error("buildTable: expected an error for an empty result, got nil")
-	}
-}
-
-// The realistic schema-drift case: status still parses, but wsname has been
-// renamed or reformatted, so every pair is skipped and the table comes out
-// empty. Must be an error to back off from, not a silently empty venue.
-func TestBuildTableAllPairsDroppedIsError(t *testing.T) {
-	body := `{"error":[],"result":{
-		"XXBTZUSD":{"wsname":"XBTUSD","status":"online"},
-		"XETHZUSD":{"wsname":"ETHUSD","status":"online"}
-	}}`
-
-	_, err := buildTable([]byte(body))
-	if err == nil {
-		t.Fatal("buildTable: expected an error when every pair is dropped, got nil")
-	}
-	if !strings.Contains(err.Error(), "2") {
-		t.Errorf("error %q should report how many pairs were dropped", err)
-	}
-}
-
-func TestBuildTableMalformedJSONIsError(t *testing.T) {
-	if _, err := buildTable([]byte(`not json at all`)); err == nil {
-		t.Error("buildTable: expected an error for a non-JSON body, got nil")
-	}
-}
-
-// --- tickerLoader tests ---
 
 func TestTickerLoaderReturnsTable(t *testing.T) {
-	server := testServer(t, assetPairsBody)
-	h := poller.NewHTTP(venue, 10*time.Second)
+	server := sourcetest.Server(t, assetPairsBody)
 
-	table, err := tickerLoader(context.Background(), h, server.URL)
+	table, err := tickerLoader(context.Background(), testHTTP(), server.URL)
 	if err != nil {
-		t.Fatalf("tickerLoader: %v", err)
+		t.Fatalf("tickerLoader() = %v, want nil", err)
 	}
 	if inst, ok := table["XXBTZUSD"]; !ok || inst.Market != "BTC-USD" {
 		t.Errorf("table[\"XXBTZUSD\"] = %+v, want a BTC-USD instrument", inst)
 	}
 }
 
-func TestTickerLoaderNonOKStatusIsError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer server.Close()
+func TestTickerLoaderErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		serve func(t *testing.T) string
+		why   string
+	}{
+		{
+			name:  "rate limited",
+			serve: func(t *testing.T) string { return sourcetest.StatusServer(t, http.StatusTooManyRequests).URL },
+			why:   "a 429 must back the poller off",
+		},
+		{
+			// End-to-end form of the empty-table trap: a 200 with a body
+			// that parses cleanly, so only buildTable's emptiness check
+			// makes it an error.
+			name:  "empty result",
+			serve: func(t *testing.T) string { return sourcetest.Server(t, `{"error":[],"result":{}}`).URL },
+			why:   "an empty table would silence the venue without an error",
+		},
+		{
+			name:  "unparseable body",
+			serve: func(t *testing.T) string { return sourcetest.Server(t, `not json at all`).URL },
+			why:   "schema drift must be reported, not swallowed",
+		},
+	}
 
-	h := poller.NewHTTP(venue, 10*time.Second)
-	if _, err := tickerLoader(context.Background(), h, server.URL); err == nil {
-		t.Error("tickerLoader: expected an error for a 429, got nil")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := tickerLoader(context.Background(), testHTTP(), c.serve(t)); err == nil {
+				t.Errorf("tickerLoader() = nil error, want one -- %s", c.why)
+			}
+		})
 	}
 }
 
-// End-to-end form of the empty-table trap: a 200 with a body that parses
-// cleanly, so only buildTable's emptiness check makes it an error.
-func TestTickerLoaderEmptyResultIsError(t *testing.T) {
-	server := testServer(t, `{"error":[],"result":{}}`)
-	h := poller.NewHTTP(venue, 10*time.Second)
+// --- adapter construction ---
 
-	if _, err := tickerLoader(context.Background(), h, server.URL); err == nil {
-		t.Error("tickerLoader: expected an error for an empty result, got nil")
+var _ source.Source = (*Adapter)(nil)
+
+func TestNewUsesVenueName(t *testing.T) {
+	if got := New(Config{}).Name(); got != venue {
+		t.Errorf("Name() = %q, want %q", got, venue)
 	}
 }
 
-func TestTickerLoaderMalformedBodyIsError(t *testing.T) {
-	server := testServer(t, `not json at all`)
-	h := poller.NewHTTP(venue, 10*time.Second)
+func TestConfigWithDefaults(t *testing.T) {
+	got := Config{}.withDefaults()
 
-	if _, err := tickerLoader(context.Background(), h, server.URL); err == nil {
-		t.Error("tickerLoader: expected an error for a non-JSON body, got nil")
+	if got.TickersURL != defaultTickersURL {
+		t.Errorf("TickersURL = %q, want %q", got.TickersURL, defaultTickersURL)
+	}
+	if got.AssetPairsURL != defaultAssetPairsURL {
+		t.Errorf("AssetPairsURL = %q, want %q", got.AssetPairsURL, defaultAssetPairsURL)
+	}
+	// Ticker and AssetPairs are different endpoints; wiring one into the
+	// other would leave the poller parsing one as the other forever.
+	if got.TickersURL == got.AssetPairsURL {
+		t.Error("TickersURL and AssetPairsURL resolved to the same endpoint")
+	}
+	if got.Tuning.HTTPTimeout == 0 {
+		t.Error("Tuning was not defaulted")
 	}
 }
 
-// tickerLoader must stay usable as the symbols.Loader the poller calls -- this
-// is what makes the closure in New() compile.
-func TestTickerLoaderSatisfiesLoader(t *testing.T) {
-	h := poller.NewHTTP(venue, 10*time.Second)
-	var _ symbols.Loader = func(ctx context.Context) (symbols.Table, error) {
-		return tickerLoader(ctx, h, defaultAssetPairsURL)
+func TestConfigWithDefaultsKeepsExplicitValues(t *testing.T) {
+	cfg := Config{
+		TickersURL:    "http://tickers.invalid",
+		AssetPairsURL: "http://pairs.invalid",
+		Tuning:        poller.Tuning{HTTPTimeout: time.Second},
+	}
+
+	got := cfg.withDefaults()
+	if got.TickersURL != cfg.TickersURL || got.AssetPairsURL != cfg.AssetPairsURL {
+		t.Errorf("URLs = %q / %q, want the explicit %q / %q",
+			got.TickersURL, got.AssetPairsURL, cfg.TickersURL, cfg.AssetPairsURL)
+	}
+	if got.Tuning.HTTPTimeout != time.Second {
+		t.Errorf("Tuning.HTTPTimeout = %v, want the explicit 1s", got.Tuning.HTTPTimeout)
+	}
+}
+
+// --- adapter end to end ---
+
+// The one test that proves the whole venue adapter works: the loader closure
+// New builds is bound to the right URL, the symbol table it returns resolves
+// the ticker rows, and the poller turns them into canonical quotes. A
+// withDefaults test can only check the URLs are distinct strings -- this
+// checks they are wired to the endpoints that actually serve them.
+func TestAdapterRunProducesQuotes(t *testing.T) {
+	tickers := sourcetest.Server(t, `{"error":[],"result":{"XXBTZUSD":{"a":["65433.0","1","2.1"],"b":["65432.0","1","3.5"]}}}`)
+	pairs := sourcetest.Server(t, assetPairsBody)
+
+	adapter := New(Config{
+		TickersURL:    tickers.URL,
+		AssetPairsURL: pairs.URL,
+		Tuning: poller.Tuning{
+			PollInterval:   10 * time.Millisecond,
+			InitialBackoff: 10 * time.Millisecond,
+			MaxBackoff:     50 * time.Millisecond,
+			SymbolsRefresh: time.Hour,
+		},
+	})
+
+	if adapter.Name() != venue {
+		t.Errorf("Name() = %q, want %q", adapter.Name(), venue)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan quote.Quote, 16)
+	errCh := make(chan error, 1)
+	go func() { errCh <- adapter.Run(ctx, out) }()
+
+	select {
+	case q := <-out:
+		if q.Venue != venue {
+			t.Errorf("Venue = %q, want %q", q.Venue, venue)
+		}
+		if q.Market != "BTC-USD" {
+			t.Errorf("Market = %q, want %q -- the symbol table did not resolve the ticker row", q.Market, "BTC-USD")
+		}
+		if q.Selection != "bid" && q.Selection != "ask" {
+			t.Errorf("Selection = %q, want bid or ask", q.Selection)
+		}
+		if q.Price <= 0 {
+			t.Errorf("Price = %v, want a real price", q.Price)
+		}
+	case err := <-errCh:
+		t.Fatalf("Run returned %v before producing a quote", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no quote arrived from the adapter")
+	}
+}
+
+// --- registry integration ---
+
+func TestRegistryLoadsFromTickerLoader(t *testing.T) {
+	server := sourcetest.Server(t, assetPairsBody)
+	loader := func(ctx context.Context) (symbols.Table, error) {
+		return tickerLoader(ctx, testHTTP(), server.URL)
+	}
+
+	r := symbols.NewRegistry(loader, time.Hour)
+	if err := r.Load(context.Background()); err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+
+	inst, ok := r.Lookup("XXBTZUSD")
+	if !ok {
+		t.Fatal("Lookup(\"XXBTZUSD\") = false, want true")
+	}
+	if inst.Market != "BTC-USD" {
+		t.Errorf("Market = %q, want %q", inst.Market, "BTC-USD")
 	}
 }

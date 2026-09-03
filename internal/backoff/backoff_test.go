@@ -2,93 +2,130 @@ package backoff
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestJitterNonPositiveReturnsZero(t *testing.T) {
-	if got := Jitter(0); got != 0 {
-		t.Errorf("Jitter(0) = %v, want 0", got)
-	}
-	if got := Jitter(-time.Second); got != 0 {
-		t.Errorf("Jitter(-1s) = %v, want 0", got)
-	}
-}
-
-func TestJitterIsWithinBounds(t *testing.T) {
-	max := 100 * time.Millisecond
-	for range 1000 {
-		got := Jitter(max)
-		if got < 0 || got >= max {
-			t.Fatalf("Jitter(%v) = %v, want value in [0, %v)", max, got, max)
+func TestJitter(t *testing.T) {
+	t.Run("non-positive durations return zero", func(t *testing.T) {
+		for _, d := range []time.Duration{0, -time.Nanosecond, -time.Second} {
+			if got := Jitter(d); got != 0 {
+				t.Errorf("Jitter(%v) = %v, want 0", d, got)
+			}
 		}
+	})
+
+	t.Run("stays within [0, d)", func(t *testing.T) {
+		const d = 100 * time.Millisecond
+		for range 1000 {
+			if got := Jitter(d); got < 0 || got >= d {
+				t.Fatalf("Jitter(%v) = %v, want a value in [0, %v)", d, got, d)
+			}
+		}
+	})
+
+	// Jitter exists to stop every venue's poller retrying in lockstep after
+	// a shared outage, so a constant return would defeat its only purpose.
+	t.Run("varies across calls", func(t *testing.T) {
+		const d = time.Hour
+		first := Jitter(d)
+		for range 100 {
+			if Jitter(d) != first {
+				return
+			}
+		}
+		t.Errorf("Jitter(%v) returned %v on all 100 calls, want variation", d, first)
+	})
+}
+
+func TestNext(t *testing.T) {
+	cases := []struct {
+		name         string
+		current, max time.Duration
+		want         time.Duration
+	}{
+		{"doubles below the ceiling", 10 * time.Millisecond, time.Second, 20 * time.Millisecond},
+		{"caps when doubling would exceed the ceiling", 600 * time.Millisecond, time.Second, time.Second},
+		{"holds at the ceiling", time.Second, time.Second, time.Second},
+		{"clamps back down from above the ceiling", 2 * time.Second, time.Second, time.Second},
+		// Doubling zero stays zero forever, so a caller that starts from an
+		// unset backoff would retry in a hot loop. poller.New defends against
+		// that by applying Tuning defaults; this pins the arithmetic that
+		// makes the defence necessary.
+		{"zero stays zero", 0, time.Second, 0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Next(c.current, c.max); got != c.want {
+				t.Errorf("Next(%v, %v) = %v, want %v", c.current, c.max, got, c.want)
+			}
+		})
 	}
 }
 
-func TestJitterVaries(t *testing.T) {
-	max := time.Hour
-	first := Jitter(max)
+// Next must never hand back more than max, whatever it is given.
+func TestNextNeverExceedsMax(t *testing.T) {
+	const max = 60 * time.Second
+
+	current := time.Millisecond
 	for range 100 {
-		if Jitter(max) != first {
-			return
+		current = Next(current, max)
+		if current > max {
+			t.Fatalf("Next escalated to %v, above the %v ceiling", current, max)
 		}
 	}
-	t.Errorf("Jitter(%v) returned %v every time across 100 calls, want variation", max, first)
-}
-
-func TestSleepReturnsNilAfterDuration(t *testing.T) {
-	err := Sleep(context.Background(), time.Millisecond)
-	if err != nil {
-		t.Errorf("Sleep() = %v, want nil", err)
+	if current != max {
+		t.Errorf("after 100 doublings Next settled at %v, want the %v ceiling", current, max)
 	}
 }
 
-func TestSleepReturnsContextErrorWhenCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestSleep(t *testing.T) {
+	t.Run("returns nil once the duration elapses", func(t *testing.T) {
+		if err := Sleep(context.Background(), time.Millisecond); err != nil {
+			t.Errorf("Sleep() = %v, want nil", err)
+		}
+	})
 
-	err := Sleep(ctx, time.Hour)
-	if err != context.Canceled {
-		t.Errorf("Sleep() = %v, want %v", err, context.Canceled)
+	// A poller parked in a long backoff must abandon it the moment the
+	// process is shutting down, rather than holding shutdown open.
+	cases := []struct {
+		name string
+		ctx  func(t *testing.T) context.Context
+		want error
+	}{
+		{
+			name: "cancelled context",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "expired deadline",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+				t.Cleanup(cancel)
+				return ctx
+			},
+			want: context.DeadlineExceeded,
+		},
 	}
-}
 
-func TestSleepReturnsDeadlineExceeded(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			start := time.Now()
+			err := Sleep(c.ctx(t), time.Hour)
 
-	err := Sleep(ctx, time.Hour)
-	if err != context.DeadlineExceeded {
-		t.Errorf("Sleep() = %v, want %v", err, context.DeadlineExceeded)
-	}
-}
-
-func TestNextDoublesCurrent(t *testing.T) {
-	got := Next(10*time.Millisecond, time.Second)
-	want := 20 * time.Millisecond
-	if got != want {
-		t.Errorf("Next(10ms, 1s) = %v, want %v", got, want)
-	}
-}
-
-func TestNextCapsAtMaxWhenDoublingExceedsIt(t *testing.T) {
-	got := Next(600*time.Millisecond, time.Second)
-	want := time.Second
-	if got != want {
-		t.Errorf("Next(600ms, 1s) = %v, want %v", got, want)
-	}
-}
-
-func TestNextReturnsMaxWhenCurrentAtMax(t *testing.T) {
-	got := Next(time.Second, time.Second)
-	if got != time.Second {
-		t.Errorf("Next(1s, 1s) = %v, want 1s", got)
-	}
-}
-
-func TestNextReturnsMaxWhenCurrentExceedsMax(t *testing.T) {
-	got := Next(2*time.Second, time.Second)
-	if got != time.Second {
-		t.Errorf("Next(2s, 1s) = %v, want 1s", got)
+			if !errors.Is(err, c.want) {
+				t.Errorf("Sleep() = %v, want %v", err, c.want)
+			}
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("Sleep took %v to abandon a 1h wait, want it to return promptly", elapsed)
+			}
+		})
 	}
 }

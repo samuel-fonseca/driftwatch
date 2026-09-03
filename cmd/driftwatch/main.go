@@ -69,7 +69,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	pipelineDone := make(chan struct{})
 	go func() {
+		defer close(pipelineDone)
 		if err := p.Run(ctx); err != nil {
 			log.Printf("pipe stopped: %v", err)
 		}
@@ -90,6 +92,8 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
 	}
+
+	<-pipelineDone
 
 	log.Println("shutdown complete")
 }

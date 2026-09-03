@@ -175,39 +175,11 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 	}
 	d.latest[q.Market][q.Selection][q.Venue] = q
 
-	var bestBid, bestAsk quote.Quote
-	var haveBid, haveAsk bool
-	var skippedStale bool
-	var lowestBid, highestAsk float64
-
 	now := time.Now()
-	for venue, bidQuote := range d.latest[q.Market]["bid"] {
-		if !d.isLive(venue, now) {
-			skippedStale = true
-			continue
-		}
-		if !haveBid || bidQuote.Price > bestBid.Price {
-			bestBid = bidQuote
-		}
-		if !haveBid || bidQuote.Price < lowestBid {
-			lowestBid = bidQuote.Price
-		}
-		haveBid = true
-	}
-
-	for venue, askQuote := range d.latest[q.Market]["ask"] {
-		if !d.isLive(venue, now) {
-			skippedStale = true
-			continue
-		}
-		if !haveAsk || askQuote.Price < bestAsk.Price {
-			bestAsk = askQuote
-		}
-		if !haveAsk || askQuote.Price > highestAsk {
-			highestAsk = askQuote.Price
-		}
-		haveAsk = true
-	}
+	sides := d.latest[q.Market]
+	bestBid, lowestBid, haveBid, staleBids := d.bestSide(sides["bid"], now, highestPrice)
+	bestAsk, highestAsk, haveAsk, staleAsks := d.bestSide(sides["ask"], now, lowestPrice)
+	skippedStale := staleBids || staleAsks
 
 	if !haveBid || !haveAsk {
 		if skippedStale {
@@ -259,6 +231,45 @@ func (d *Detector) Observe(q quote.Quote) *Signal {
 		DetectedAt: time.Now(),
 	}
 }
+
+func (d *Detector) bestSide(
+	byVenue map[string]quote.Quote,
+	now time.Time,
+	wantHighest bool,
+) (best quote.Quote, worst float64, ok, skippedStale bool) {
+	for venue, q := range byVenue {
+		if !d.isLive(venue, now) {
+			skippedStale = true
+			continue
+		}
+		if !ok {
+			best, worst, ok = q, q.Price, true
+			continue
+		}
+		if wantHighest {
+			if q.Price > best.Price {
+				best = q
+			}
+			if q.Price < worst {
+				worst = q.Price
+			}
+			continue
+		}
+		if q.Price < best.Price {
+			best = q
+		}
+		if q.Price > worst {
+			worst = q.Price
+		}
+	}
+	return best, worst, ok, skippedStale
+}
+
+// getting clever with code redability :)
+const (
+	highestPrice = true
+	lowestPrice  = false
+)
 
 func dispersed(high, low, ratio float64) bool {
 	return ratio > 1 && low > 0 && high/low > ratio
